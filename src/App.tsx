@@ -21,6 +21,7 @@ import {
   warm,
   interrupt,
   watchServers,
+  watchBrain,
   watchPanels,
   watchBlades,
   watchCapture,
@@ -425,6 +426,10 @@ export default function App() {
     s.setPhase('boot')
 
     watchServers((servers) => store.getState().setConnected(servers))
+    // Which link of the chain is answering — announced on connect and on
+    // every mid-session failover, so the rail's BRAIN line is always the
+    // brain that is actually speaking.
+    watchBrain((b) => store.getState().setBrain(b))
     watchPanels((panel) => store.getState().pushPanel(panel))
     watchBlades((blade) => store.getState().pushBlade(blade))
 

@@ -22,17 +22,18 @@ import {
   cloudVoiceId,
   setCloudVoice,
 } from '../lib/tts'
-import { caps } from '../lib/capabilities'
+import { caps, probeCapabilities, type ChainLink } from '../lib/capabilities'
 
 /**
  * The settings corner.
  *
- * A small gear at the top right, and behind it the three things a person can
+ * A small gear at the top right, and behind it the four things a person can
  * reasonably want to change about an assistant they live with: the shape it
- * presents in the centre of the scene, which character it is, and which
- * voice it speaks in.
+ * presents in the centre of the scene, which character it is, which voice it
+ * speaks in, and — read-only — which engines are answering and what the
+ * fallback chains look like underneath them.
  *
- * Each of the three is a collapsible section — a tab that folds. The stack
+ * Each of the sections is a collapsible fold — a tab that folds. The stack
  * used to show every list at once, which pushed the panel past the height of
  * the screen once the voice catalogue arrived; now each header carries a
  * one-word summary of the current choice, so the collapsed panel still
@@ -55,10 +56,16 @@ import { caps } from '../lib/capabilities'
  * first, best-first, and loaded lazily because Chrome populates it
  * asynchronously. Picking one auditions it immediately: hearing a voice is
  * the only way to choose one.
+ *
+ * The engines section is the resilience layer made visible (the chains live
+ * in bridge/providers.mjs): which link of each chain is answering, which are
+ * merely configured, which are benched by the circuit breaker. Read-only —
+ * keys live in .env.local by design, never in a browser panel — with each
+ * row naming the exact variable that turns its link on.
  */
 
-/** The three foldable sections; null = all folded. */
-type SectionId = 'avatar' | 'persona' | 'voice'
+/** The foldable sections; null = all folded. */
+type SectionId = 'avatar' | 'persona' | 'voice' | 'engines'
 
 /**
  * One foldable section: header (title · current value · chevron) plus a
@@ -124,15 +131,62 @@ function Section({
   )
 }
 
+/** The status pill for one link of a chain. The wording is the whole UI:
+ *  LIVE (answering now) / READY (configured, standing by) / COOLING (benched
+ *  by the breaker) / ERROR (last call failed) / OFF (no key, and the exact
+ *  variable that would turn it on). */
+function linkState(
+  link: ChainLink,
+  live: boolean,
+): { text: string; cls: string } {
+  if (!link.configured) return { text: `OFF · ${link.note}`, cls: 'off' }
+  if (live) return { text: 'LIVE', cls: 'live' }
+  if (link.cooling) return { text: 'COOLING', cls: 'cool' }
+  if (link.state === 'err') return { text: 'ERROR', cls: 'err' }
+  return { text: 'READY', cls: 'ready' }
+}
+
+/** One row of a chain: name, status pill, and the key that enables it. The
+ *  title carries the last error when there was one — the row stays one line,
+ *  the failure stays one hover away. */
+function ChainRow({
+  link,
+  live,
+  last,
+}: {
+  link: ChainLink
+  live: boolean
+  last: boolean
+}) {
+  const s = linkState(link, live)
+  return (
+    <div
+      className={`settings-prov${live ? ' on' : ''}`}
+      title={link.error || (link.configured ? link.note : `Set ${link.note} in .env.local to enable`)}
+    >
+      <span className={`settings-prov-dot ${s.cls}`} aria-hidden="true" />
+      <span className="settings-prov-name">{link.label}</span>
+      <span className={`settings-prov-state ${s.cls}`}>{s.text}</span>
+      {!link.configured && !last && <span className="settings-prov-arrow">↓</span>}
+    </div>
+  )
+}
+
 export function Settings() {
   const phase = useStore((s) => s.phase)
   const persona = useStore((s) => s.persona)
   const setPersona = useStore((s) => s.setPersona)
   const avatar = useStore((s) => s.avatar)
   const setAvatar = useStore((s) => s.setAvatar)
+  const brain = useStore((s) => s.brain)
   const setVoice = useStore((s) => s.setVoice)
   const [open, setOpen] = useState(false)
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([])
+  // A bump, not data: opening the ENGINES fold re-probes /health, and this
+  // timestamp is the re-render that spreads the fresh chain states into the
+  // rows. Without it the panel would forever show the boot's snapshot of a
+  // chain that changes as engines fail and heal.
+  const [, setChainsAt] = useState(0)
   // The fold state. AVATAR leads because it is the newest and the most
   // visual choice; everything else starts folded.
   const [section, setSection] = useState<SectionId | null>('avatar')
@@ -213,14 +267,23 @@ export function Settings() {
   const neural = neuralVoices()
   const cloudOn = caps().tts
   const eleven = caps().engine === 'elevenlabs'
+  const llmChain = caps().llm
+  const sttChain = caps().sttChain
+  const ttsChain = caps().ttsChain
 
   // The one-word summaries the folded headers show. The neural label is the
   // catalogue's own (KAZI, TONGTONG…); the system picker's names carry the
   // "(Google …)" suffix nobody reads.
   const voiceSummary = currentVoiceName().replace(/\(.*?\)/g, '').trim() || 'DEFAULT'
 
-  const toggleSection = (id: SectionId) =>
+  const toggleSection = (id: SectionId) => {
     setSection((s) => (s === id ? null : id))
+    if (id === 'engines') {
+      // The chains live in the bridge and move as engines fail and heal —
+      // re-probe on open so the rows are the bridge's now, not the boot's.
+      void probeCapabilities().then(() => setChainsAt(Date.now()))
+    }
+  }
 
   return (
     <div className="settings" ref={root}>
@@ -380,6 +443,77 @@ export function Settings() {
                   ))}
                 </div>
               )}
+            </Section>
+
+            <Section
+              id="engines"
+              title="ENGINES"
+              value={brain.label}
+              open={section === 'engines'}
+              onToggle={toggleSection}
+            >
+              {/* The chains, read-only. Keys are set in .env.local on purpose:
+                  a browser panel is not a secrets store, and every row names
+                  the variable that turns its link on. */}
+              {llmChain ? (
+                <>
+                  <div className="settings-title">BRAIN · FAILS OVER AUTOMATICALLY</div>
+                  {llmChain.providers.map((p, i) => (
+                    <ChainRow
+                      key={p.id}
+                      link={p}
+                      live={p.id === brain.id}
+                      last={i === llmChain.providers.length - 1}
+                    />
+                  ))}
+                </>
+              ) : (
+                <div className="settings-empty">bridge not probed</div>
+              )}
+
+              <div className="settings-title" style={{ marginTop: 8 }}>
+                LISTENING · FAILS OVER PER PHRASE
+              </div>
+              {sttChain.length ? (
+                sttChain.map((p, i) => (
+                  <ChainRow key={p.id} link={p} live={false} last={i === sttChain.length - 1} />
+                ))
+              ) : (
+                <div className="settings-empty">no transcription chain</div>
+              )}
+              {/* The browser's own recogniser is the chain's last link, and it
+                  lives on the other side of the wire — the bridge can't report
+                  it, so it's drawn here, always on. */}
+              <div className="settings-prov">
+                <span className="settings-prov-dot ready" aria-hidden="true" />
+                <span className="settings-prov-name">BROWSER</span>
+                <span className="settings-prov-state ready">LAST RESORT</span>
+              </div>
+
+              <div className="settings-title" style={{ marginTop: 8 }}>
+                SPEECH · FAILS OVER PER SENTENCE
+              </div>
+              {ttsChain.length ? (
+                ttsChain.map((p, i) => (
+                  <ChainRow
+                    key={p.id}
+                    link={p}
+                    live={
+                      (caps().engine === 'elevenlabs' && p.id === 'elevenlabs') ||
+                      (caps().engine === 'zai' && p.id === 'zai') ||
+                      (caps().engine === 'local' && p.id === 'local')
+                    }
+                    last={i === ttsChain.length - 1}
+                  />
+                ))
+              ) : (
+                <div className="settings-empty">no speech chain</div>
+              )}
+
+              <div className="settings-empty">
+                Links are enabled by keys in .env.local — see SETUP.md. A failed
+                link is skipped for a while, then retried.
+              </div>
             </Section>
           </motion.div>
         )}

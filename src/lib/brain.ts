@@ -46,6 +46,14 @@ export function watchServers(fn: (servers: string[]) => void): void {
   if (usingBridge) bridge.watchServers(fn)
 }
 
+/** Which link of the LLM chain is answering (z-ai → Gemini → local). The
+ *  bridge announces it on connect and again on every mid-session failover;
+ *  the direct path has one brain and nothing to switch to, so the watcher
+ *  simply never fires there. */
+export function watchBrain(fn: (b: bridge.BrainStatus) => void): void {
+  if (usingBridge) bridge.watchBrain(fn)
+}
+
 /** HUD panels are pushed mid-turn by the `display` tool, not returned by ask(). */
 export function watchPanels(fn: (panel: Panel) => void): void {
   if (usingBridge) bridge.watchPanels(fn)

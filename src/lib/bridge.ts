@@ -35,6 +35,7 @@ type Frame = {
   seconds?: number
   when?: string
   servers?: Array<string | { name?: string }>
+  brain?: { id?: unknown; label?: unknown }
 }
 
 /** Every question gets an id so its answer can be told from anyone else's. */
@@ -52,6 +53,29 @@ export const bridgeServers = () => servers
 let onServers: ((s: string[]) => void) | null = null
 export function watchServers(fn: (s: string[]) => void) {
   onServers = fn
+}
+
+/** Which link of the LLM chain is answering — the bridge announces it with
+ *  the ready frame and again, mid-session, on every fallback switch (see
+ *  providers.mjs: z-ai → Gemini → a local server). Typed at the border: a
+ *  label that isn't a string is dropped rather than trusted. */
+export type BrainStatus = { id: string; label: string }
+let brain: BrainStatus = { id: 'zai', label: 'Z-AI' }
+export const brainStatus = () => brain
+
+let onBrain: ((b: BrainStatus) => void) | null = null
+export function watchBrain(fn: (b: BrainStatus) => void) {
+  onBrain = fn
+}
+
+function noteBrain(raw: unknown) {
+  const id = typeof (raw as BrainStatus | undefined)?.id === 'string' ? (raw as BrainStatus).id : ''
+  const label =
+    typeof (raw as BrainStatus | undefined)?.label === 'string' ? (raw as BrainStatus).label : ''
+  if (!id || !label) return
+  if (brain.id === id && brain.label === label) return
+  brain = { id, label }
+  onBrain?.(brain)
 }
 
 /** Panels arrive out of band — they're pushed while a turn is in flight,
@@ -176,7 +200,12 @@ function dispatch(ws: WebSocket) {
         .map((s) => (typeof s === 'string' ? s : (s.name ?? '')))
         .filter(Boolean)
       onServers?.(servers)
+      noteBrain(msg.brain)
       firstReady.resolve()
+    } else if (msg.type === 'provider' && msg.brain) {
+      // A fallback switch mid-session — the chain moved to another link and
+      // the HUD should say so the moment it happens.
+      noteBrain(msg.brain)
     } else if (msg.type === 'panel' && msg.panel) {
       onPanel?.(msg.panel)
     } else if (msg.type === 'blade' && msg.blade) {

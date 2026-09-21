@@ -220,6 +220,25 @@ then the triangular arc reactor lighting up — with a start-up sound under it
 Everything is optional in bridge mode. Frontend settings live in `.env.local`
 (copy `.env.example`); bridge settings are environment variables.
 
+### Fallback chains
+
+No single service is load-bearing. If the brain, the ear or the voice fails,
+the next provider takes over automatically — mid-turn, mid-sentence:
+
+```
+BRAIN   z-ai (built-in)  →  Gemini  →  local (Ollama, LM Studio, …)
+EAR     Deepgram  →  ElevenLabs  →  z-ai ASR  →  local  →  the browser's recogniser
+VOICE   ElevenLabs  →  z-ai neural  →  local  →  the browser's own voice
+```
+
+A failing link is benched for a while and retried; the HUD rail shows
+`BRAIN · <engine>` and marks the moment a fallback takes over; the settings
+gear has an ENGINES panel with the state of every link. Keys are set in
+`.env.local` — see **[SETUP.md](./SETUP.md)** for where to get each one and
+how to run the local servers. Porting the layer into another project:
+**[MERGE_PROMPT.md](./MERGE_PROMPT.md)** is a ready-to-paste prompt for your
+agent.
+
 ### Bridge
 
 | Variable | Default | Effect |
@@ -233,6 +252,14 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `JARVIS_FILE_ROOTS` | — | Roots the `/file` endpoint may serve from |
 | `JARVIS_VOICE_ID` | — | ElevenLabs voice id |
 | `ELEVENLABS_API_KEY` | — | Optional; enables the ElevenLabs voice + Scribe |
+| `GEMINI_API_KEY` | — | Brain fallback link 2 (see SETUP.md) |
+| `LOCAL_LLM_BASE_URL` | — | Brain fallback link 3 (Ollama et al.) |
+| `DEEPGRAM_API_KEY` | — | Ear fallback link 1 |
+| `LOCAL_STT_URL` | — | Ear fallback link 4 (faster-whisper et al.) |
+| `LOCAL_TTS_URL` | — | Voice fallback link 3 (kokoro-fastapi et al.) |
+| `JARVIS_LLM_PROVIDER` | auto | Pin the brain to `zai`/`gemini`/`local` |
+| `JARVIS_STT_PROVIDER` | auto | Pin the ear to one provider |
+| `JARVIS_TTS_PROVIDER` | auto | Pin the voice to one provider |
 
 ### Frontend (`.env.local`)
 

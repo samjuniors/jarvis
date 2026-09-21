@@ -17,7 +17,7 @@
  * there is no Chrome extension host or camera in this deployment.
  */
 
-import ZAI from 'z-ai-web-dev-sdk'
+import { openLlmStream, llmInfo, zaiClient } from './providers.mjs'
 import { probeUrl } from './page.mjs'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -616,7 +616,6 @@ try {
  *   finishTurn()      the turn is over — unblock anyone waiting on it
  */
 export function createBrain(io) {
-  let zai = null
   let personaId = DEFAULT_PERSONA
   const messages = [{ role: 'system', content: personaPrompt(personaId) }]
   const queue = []
@@ -625,8 +624,9 @@ export function createBrain(io) {
   let aborted = false // set by interrupt(), cleared at turn start
 
   async function sdk() {
-    if (!zai) zai = await ZAI.create()
-    return zai
+    // The shared client from providers.mjs — one SDK instance for the brain,
+    // the speech engine and the transcriber, one place for it to fail.
+    return zaiClient()
   }
 
   /**
@@ -921,22 +921,45 @@ export function createBrain(io) {
 
   /**
    * One model request: streamed. Returns { content, toolCalls, finishReason }.
-   * Text deltas are forwarded to the browser as they arrive; tool calls come
-   * back complete in a single chunk (verified against the backend), but are
-   * accumulated by index regardless so a split call still works.
+   *
+   * The provider is no longer assumed — openLlmStream walks the chain (z-ai
+   * → Gemini → a local server) and hands back the first live SSE reader, so
+   * a rate-limited brain degrades to a fallback mid-session instead of
+   * failing the turn. Text deltas are forwarded to the browser as they
+   * arrive; tool calls come back complete in a single chunk (verified against
+   * the backend), but are accumulated by index regardless so a split call
+   * still works.
+   *
+   * Every provider speaks the OpenAI wire format, so one parser serves them
+   * all. Reads carry a stall guard rather than the request a timeout: a
+   * local model that is slow is normal, a connection that has gone quiet for
+   * 90 seconds is a dead link, and the difference is worth failing over on.
    */
   async function streamModel(deadline) {
-    const api = await sdk()
     const body = {
       messages: trimHistory(),
       tools: TOOLS,
       stream: true,
-      thinking: { type: 'disabled' },
     }
 
-    const res = await withRetry(() => api.chat.completions.create(body))
-    const reader = res?.getReader ? res.getReader() : null
-    if (!reader) throw new Error('the model returned no stream')
+    const { reader } = await openLlmStream(body, (p) =>
+      io.send({ type: 'provider', brain: { id: p.id, label: p.label } }),
+    )
+
+    const readWithStall = async () => {
+      let timer
+      const stalled = new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('the model stream went quiet')),
+          90_000,
+        )
+      })
+      try {
+        return await Promise.race([reader.read(), stalled])
+      } finally {
+        clearTimeout(timer)
+      }
+    }
 
     const decoder = new TextDecoder()
     let buf = ''
@@ -977,7 +1000,7 @@ export function createBrain(io) {
         reader.cancel().catch(() => {})
         throw ABORTED
       }
-      const { done, value } = await reader.read()
+      const { done, value } = await readWithStall()
       if (done) break
       buf += decoder.decode(value, { stream: true })
       let nl
@@ -1084,9 +1107,16 @@ export function createBrain(io) {
         return
       }
       console.error('[jarvis] turn failed:', err)
+      // Every link in the chain has failed — say so in the character's own
+      // register, and name the ones that were tried, because a person staring
+      // at a dead HUD wants to know whether to wait or to fix something.
+      const tried = llmInfo()
+        .providers.filter((p) => p.configured)
+        .map((p) => p.label)
+        .join(', ')
       io.sendTurn({
         type: 'error',
-        message: 'I am afraid the connection to my reasoning engine has failed. Try again in a moment.',
+        message: `I am afraid every reasoning engine is unreachable — ${tried || 'none'} — try again in a moment.`,
       })
       io.finishTurn()
     }
@@ -1138,7 +1168,11 @@ export function createBrain(io) {
     aborted = true
   }
 
-  io.send({ type: 'ready', servers: ['web', 'page', 'images', 'display', 'interface'] })
+  io.send({
+    type: 'ready',
+    servers: ['web', 'page', 'images', 'display', 'interface'],
+    brain: llmInfo(),
+  })
 
   return { ask, interrupt, close }
 }

@@ -25,6 +25,16 @@ import { fileURLToPath } from 'node:url'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { renderPage } from './page.mjs'
 import ZAI from 'z-ai-web-dev-sdk'
+import {
+  probeZaiAsr,
+  transcribeAnywhere,
+  sttInfo,
+  anySttAvailable,
+  llmInfo,
+  localTtsAvailable,
+  synthesizeLocalTts,
+  ttsPinId,
+} from './providers.mjs'
 
 const REPO_ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..')
 
@@ -566,22 +576,58 @@ const handleRequest = async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    // The browser reads this once at boot to decide which voice engine to use.
-    // Three tiers, best first: an ElevenLabs key (best English voices, needs a
-    // key the user supplies), then the z-ai neural engine (no key, conversational
-    // female/male voices — what this sandbox runs on), then the browser's own
-    // speech. STT only upgrades with an ElevenLabs key (Scribe); the browser's
-    // own recogniser covers everyone else.
+    // The browser reads this once at boot to decide which engines to use, and
+    // the settings panel reads the chains to show which links exist. The
+    // tiers, best first: an ElevenLabs key (best English voices, needs a key
+    // the user supplies), then the z-ai neural engine (no key, conversational
+    // female/male voices — what this sandbox runs on), then a local speech
+    // server, then the browser's own speech. STT walks its own chain:
+    // Deepgram → ElevenLabs Scribe → z-ai ASR (no key) → a local server.
     const eleven = Boolean(elevenKey())
-    const engine = eleven ? 'elevenlabs' : 'zai'
+    const pin = ttsPinId()
+    const engine =
+      pin === 'local' && localTtsAvailable()
+        ? 'local'
+        : eleven && pin !== 'zai' && pin !== 'local'
+          ? 'elevenlabs'
+          : 'zai'
+    const stt = anySttAvailable()
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
     return res.end(
       JSON.stringify({
         ok: true,
         tts: true,
-        stt: eleven,
+        stt,
         engine,
         voices: ZAI_VOICES,
+        llm: llmInfo(),
+        sttChain: sttInfo(),
+        ttsChain: [
+          {
+            id: 'elevenlabs',
+            label: 'ELEVENLABS',
+            note: 'ELEVENLABS_API_KEY',
+            configured: eleven,
+          },
+          {
+            id: 'zai',
+            label: 'Z-AI NEURAL',
+            note: 'built-in, no key',
+            configured: true,
+          },
+          {
+            id: 'local',
+            label: 'LOCAL',
+            note: 'LOCAL_TTS_URL',
+            configured: localTtsAvailable(),
+          },
+          {
+            id: 'system',
+            label: 'SYSTEM',
+            note: 'the browser\u2019s own voice',
+            configured: true,
+          },
+        ],
       }),
     )
   }
@@ -738,9 +784,11 @@ const handleRequest = async (req, res) => {
 
     // ---- tier 1: ElevenLabs, when the user has put a key in .env.local -----
     // (or their Claude Code MCP config). Best English voices there are; when
-    // it is absent we never even dial them.
+    // it is absent we never even dial them. A pin (JARVIS_TTS_PROVIDER)
+    // collapses the ladder to the one link a person chose on purpose.
+    const pin = ttsPinId()
     const key = elevenKey()
-    if (key) {
+    if (key && pin !== 'zai' && pin !== 'local') {
       try {
         const upstream = await fetch(
           `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
@@ -789,6 +837,25 @@ const handleRequest = async (req, res) => {
     // browser's speechSynthesis. The browser sends its chosen voice id; anything
     // unrecognised falls back to the default female rather than being refused,
     // because a saved choice from a newer bridge should not brick an older one.
+    if (pin === 'local' && localTtsAvailable()) {
+      // ---- tier 3: a local speech server (kokoro-fastapi, LocalAI…) -----
+      // OpenAI-compatible /audio/speech. No cloud at all — the machine's own
+      // voice, for the person who wants nothing leaving it.
+      try {
+        const audio = await synthesizeLocalTts(text)
+        res.writeHead(200, {
+          ...cors,
+          'content-type': 'audio/mpeg',
+          'cache-control': 'no-cache',
+          'x-tts-engine': 'local',
+        })
+        return res.end(audio)
+      } catch (err) {
+        console.error('[jarvis] local tts failed:', err?.message ?? err)
+        // fall through to the neural engine — a pin is a preference, not a
+        // death sentence for the sentence.
+      }
+    }
     const voiceId = ZAI_VOICE_IDS.has(voice) ? voice : DEFAULT_ZAI_VOICE
     const clamped = Math.min(2, Math.max(0.5, Number(speed) || 1))
     const cacheKey = `${voiceId}|${clamped}|${text}`
@@ -814,23 +881,42 @@ const handleRequest = async (req, res) => {
       // 503, not 500: the browser's per-sentence fallback treats any failure
       // here as "cloud is gone, use the system voice" — which is exactly right.
       console.error('[jarvis] neural tts failed:', err?.message ?? err)
+
+      // ---- tier 3 (unpinned): the local speech server, if one exists -----
+      if (localTtsAvailable() && pin !== 'zai') {
+        try {
+          const audio = await synthesizeLocalTts(text)
+          res.writeHead(200, {
+            ...cors,
+            'content-type': 'audio/mpeg',
+            'cache-control': 'no-cache',
+            'x-tts-engine': 'local',
+          })
+          return res.end(audio)
+        } catch (err2) {
+          console.error('[jarvis] local tts failed:', err2?.message ?? err2)
+        }
+      }
+
       res.writeHead(503, cors)
       return res.end(String(err?.message ?? 'neural tts failed'))
     }
   }
 
   // Speech to text. The browser captures one spoken segment as a compressed
-  // audio blob and posts the raw bytes here; the bridge hands them to
-  // ElevenLabs Scribe and returns the transcript. This is what replaced the
-  // browser's own SpeechRecognition — that API dies silently under always-on
-  // use, and a server-side transcriber cannot. Detecting that the user is
-  // speaking at all is done locally with voice-activity detection, which never
-  // touches this endpoint; this is only for the words.
+  // audio blob and posts the raw bytes here; the chain in providers.mjs walks
+  // its links — Deepgram → ElevenLabs Scribe → the z-ai transcriber (no key)
+  // → a local server — and the first one that answers wins. This is what
+  // replaced the browser's own SpeechRecognition as the primary path: that
+  // API dies silently under always-on use, and a server-side transcriber
+  // cannot. Detecting that the user is speaking at all is still done locally
+  // with voice-activity detection, which never touches this endpoint; this is
+  // only for the words. The browser's recogniser remains the last link,
+  // client-side, for the day every server link is down.
   if (req.method === 'POST' && req.url === '/stt') {
-    const key = elevenKey()
-    if (!key) {
+    if (!anySttAvailable()) {
       res.writeHead(503, cors)
-      return res.end('no elevenlabs key')
+      return res.end('no transcription provider')
     }
 
     const type = req.headers['content-type'] || 'audio/webm'
@@ -852,7 +938,7 @@ const handleRequest = async (req, res) => {
       res.writeHead(413, cors)
       return res.end('audio too large')
     }
-    // Silence, or a click. Nothing to transcribe, and calling out to the API
+    // Silence, or a click. Nothing to transcribe, and calling out to a chain
     // for it would only add latency to a non-answer.
     if (size < 1200) {
       res.writeHead(200, { ...cors, 'content-type': 'application/json' })
@@ -860,39 +946,20 @@ const handleRequest = async (req, res) => {
     }
 
     try {
-      // The filename extension is the only hint Scribe gets about the codec, so
-      // derive it from the content-type the MediaRecorder reported rather than
-      // hard-coding one.
-      const ext = type.includes('ogg')
-        ? 'ogg'
-        : type.includes('mp4') || type.includes('mpeg')
-          ? 'mp4'
-          : type.includes('wav')
-            ? 'wav'
-            : 'webm'
-      const form = new FormData()
-      form.append('model_id', 'scribe_v1')
-      form.append(
-        'file',
-        new Blob([Buffer.concat(chunks)], { type }),
-        `speech.${ext}`,
-      )
-
-      const upstream = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
-        method: 'POST',
-        headers: { 'xi-api-key': key },
-        body: form,
+      const buffer = Buffer.concat(chunks)
+      const { text } = await transcribeAnywhere(buffer, type)
+      res.writeHead(200, {
+        ...cors,
+        'content-type': 'application/json',
+        'x-stt-engine': sttInfo().active,
       })
-      if (!upstream.ok) {
-        res.writeHead(upstream.status, cors)
-        return res.end(await upstream.text())
-      }
-      const data = await upstream.json()
-      res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-      return res.end(JSON.stringify({ text: (data.text ?? '').trim() }))
+      return res.end(JSON.stringify({ text }))
     } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      // 503: the browser treats any failure here as "the chain is down",
+      // counts it, and after a run of them degrades to its own recogniser.
+      console.error('[jarvis] every stt provider failed:', err?.message ?? err)
+      res.writeHead(503, cors)
+      return res.end(String(err?.message ?? 'transcription failed'))
     }
   }
 
@@ -1037,6 +1104,21 @@ console.log(
   `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
 )
 console.log('[jarvis] brain: z-ai-web-dev-sdk · 14 tools')
+console.log(
+  '[jarvis] chains — ' +
+    `llm ${llmInfo()
+      .providers.filter((p) => p.configured)
+      .map((p) => p.id)
+      .join(' → ') || 'none'} · ` +
+    `stt ${sttInfo()
+      .providers.filter((p) => p.configured)
+      .map((p) => p.id)
+      .join(' → ') || 'browser only'}`,
+)
+// One half-second call at boot settles whether the keyless z-ai transcriber
+// can serve this machine — /health answers 'pending' as yes until it lands,
+// so an early browser is optimistic rather than deaf.
+void probeZaiAsr()
 console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),

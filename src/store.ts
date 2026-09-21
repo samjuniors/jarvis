@@ -239,6 +239,11 @@ type State = {
    *  ignition screen and the standby hint only offer “or clap” when this is
    *  true — a hint that cannot work is worse than none. */
   clapLive: boolean
+  /** Which link of the LLM chain is answering right now — z-ai by default,
+  *  Gemini or a local server when the chain has failed over. Set from the
+  *  bridge's provider announcements so the HUD rail never claims a brain
+  *  that isn't the one speaking. */
+  brain: { id: string; label: string }
   /** Whether the camera is on and hands are being tracked. Store-backed rather
    *  than read off the tracker, because the indicator has to re-render. */
   gestures: boolean
@@ -261,6 +266,7 @@ type State = {
   setVoice: (v: string) => void
   setPersona: (p: PersonaId) => void
   setAvatar: (a: AvatarId) => void
+  setBrain: (b: { id: string; label: string }) => void
   setVoiceLive: (on: boolean) => void
   setClapLive: (on: boolean) => void
   setGestures: (on: boolean) => void
@@ -304,6 +310,7 @@ export const useStore = create<State>((set) => ({
   avatar: savedAvatar(),
   voiceLive: true,
   clapLive: false,
+  brain: { id: 'zai', label: 'Z-AI' },
   gestures: false,
   looking: null,
   panels: [],
@@ -316,6 +323,7 @@ export const useStore = create<State>((set) => ({
   setVoice: (voice) => set({ voice }),
   setPersona: (persona) => set({ persona }),
   setAvatar: (avatar) => set({ avatar }),
+  setBrain: (brain) => set({ brain }),
   setVoiceLive: (voiceLive) => set({ voiceLive }),
   setClapLive: (clapLive) => set({ clapLive }),
   setGestures: (gestures) => set({ gestures }),

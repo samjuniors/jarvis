@@ -560,6 +560,112 @@ body::after {
   padding: 4px 2px;
 }
 
+/* ── ENGINES: the provider chains, one row per link ──────────────────────
+ *
+ * A row is a status line, not a button — the chain is read-only. The dot
+ * carries the state (live glows, benched breathes, off stays dark), the pill
+ * says it in words, and the arrow between OFF links draws the fall-through
+ * order without a flowchart. */
+
+.settings-prov {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 2px;
+}
+
+.settings-prov.on {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+.settings-prov-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex: none;
+  background: currentColor;
+  opacity: 0.35;
+}
+
+.settings-prov-dot.live {
+  opacity: 1;
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 80%, transparent);
+}
+
+.settings-prov-dot.cool {
+  opacity: 0.7;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.settings-prov-dot.err {
+  opacity: 0.9;
+  background: #e06c5a;
+}
+
+.settings-prov-name {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-prov-state {
+  margin-left: auto;
+  flex: none;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  opacity: 0.55;
+  white-space: nowrap;
+}
+
+.settings-prov-state.live {
+  color: color-mix(in srgb, var(--accent) 85%, white);
+  opacity: 1;
+}
+
+.settings-prov-state.cool {
+  opacity: 0.8;
+}
+
+.settings-prov-state.err {
+  color: #e08575;
+  opacity: 0.9;
+}
+
+.settings-prov-arrow {
+  flex: none;
+  font-size: 9px;
+  opacity: 0.3;
+}
+
+/* The BRAIN rail line while a fallback engine is answering — the tick and
+   the marker go warm so the failover is legible from across the room. */
+.rail-item.brain-fallback {
+  color: #e8b45a;
+}
+
+.rail-item.brain-fallback .tick {
+  background: #e8b45a;
+  box-shadow: 0 0 8px rgba(232, 180, 90, 0.6);
+}
+
+.brain-note {
+  margin-left: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 7px;
+  letter-spacing: 0.14em;
+  padding: 1px 4px;
+  border: 1px solid rgba(232, 180, 90, 0.5);
+  border-radius: 2px;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
 @media (max-width: 700px) {
   .settings { right: 26px; top: 40px }
   .settings-panel { width: min(78vw, 264px) }

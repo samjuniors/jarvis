@@ -231,6 +231,7 @@ export function Hud() {
   const turns = useStore((s) => s.turns)
   const activeTool = useStore((s) => s.activeTool)
   const connected = useStore((s) => s.connected)
+  const brain = useStore((s) => s.brain)
   const error = useStore((s) => s.error)
   const level = useStore((s) => s.level)
   const voice = useStore((s) => s.voice)
@@ -300,6 +301,22 @@ export function Hud() {
       {ui.chrome.systems && (
         <aside className="rail rail-left">
           <div className="rail-title">SYSTEMS</div>
+          {/* Which brain is answering — the chain (z-ai → Gemini → local)
+              announces every failover, and the rail says so the moment it
+              happens. The fallback marker is the honesty: a rail that still
+              said Z-AI while Gemini spoke would be a lie. */}
+          <div
+            className={`rail-item${brain.id !== 'zai' ? ' brain-fallback' : ''}`}
+            title={
+              brain.id !== 'zai'
+                ? 'The primary engine is unreachable — this one took over.'
+                : undefined
+            }
+          >
+            <span className="tick" />
+            BRAIN · {brain.label}
+            {brain.id !== 'zai' && <span className="brain-note">FALLBACK</span>}
+          </div>
           {connected.length === 0 && <div className="rail-item dim">none linked</div>}
           {connected.map((c) => (
             <div key={c} className="rail-item">

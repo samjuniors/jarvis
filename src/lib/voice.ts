@@ -410,14 +410,45 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
     )
     return { stop: () => {}, live: () => false }
   }
-  diag.engine = caps().stt ? 'elevenlabs' : 'browser'
-  return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
+  diag.engine = caps().stt ? 'server' : 'browser'
+  return caps().stt ? startServerVoice(h) : startBrowserVoice(h)
 }
 
-/** VAD + ElevenLabs Scribe. */
-async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
+/** VAD + the bridge's transcription chain (Deepgram → ElevenLabs → z-ai →
+ *  local — see bridge/providers.mjs). */
+async function startServerVoice(h: VoiceHandlers): Promise<Voice> {
   let lastWake = 0
   let vad: Vad | null = null
+
+  /**
+   * The chain's own last link lives here, client-side. Every server
+   * transcriber failing four times in a row means the whole bridge side of
+   * hearing is down — rate limits, network, whatever — and the honest move
+   * is to hand the microphone to the browser's own recogniser mid-session
+   * rather than sit deaf waiting for a recovery that may not come. Latched
+   * per session: if the engines come back, they come back on the next boot.
+   */
+  let chainFails = 0
+  let degraded = false
+  let engine: Voice = { stop: () => {}, live: () => false }
+
+  const degradeToBrowser = async () => {
+    if (degraded) return
+    degraded = true
+    const Ctor =
+      (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
+    if (!Ctor) return // nothing to hand to — nothing to promise
+    console.warn('[jarvis] every server transcriber failed — falling back to the browser recogniser')
+    try {
+      // Stop the VAD first: it holds the microphone's analyser, and the
+      // recogniser wants the capture to itself.
+      engine.stop()
+      engine = startBrowserVoice(h)
+      h.onError('Speech service unreachable — using the browser\u2019s own recogniser.')
+    } catch (err) {
+      diag.lastError = String(err)
+    }
+  }
 
   /**
    * Segments waiting for the transcriber, oldest first.
@@ -472,11 +503,13 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         diag.restarts++
         diag.lastError = `stt ${res.status}`
         drop(`transcription failed (${res.status})`)
+        if (++chainFails >= 4) void degradeToBrowser()
         return
       }
       const { text } = (await res.json()) as { text?: string }
       const said = (text ?? '').trim()
       diag.lastError = ''
+      chainFails = 0
 
       if (!said) {
         drop('nothing intelligible in the segment')
@@ -513,6 +546,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.restarts++
       diag.lastError = String(err)
       drop('could not reach the speech service')
+      if (++chainFails >= 4) void degradeToBrowser()
     }
   }
 
@@ -527,6 +561,18 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     } finally {
       draining = false
     }
+  }
+
+  // The engine slot starts as the server path's own teardown, and is swapped
+  // by degradeToBrowser() the day the chain goes down.
+  engine = {
+    stop: () => {
+      clearInterval(guardPoll)
+      assemble.cancel()
+      vad?.stop()
+      diag.running = false
+    },
+    live: () => vad?.live() ?? false,
   }
 
   vad = await startVad({
@@ -587,13 +633,8 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   }, 200)
 
   return {
-    stop: () => {
-      clearInterval(guardPoll)
-      assemble.cancel()
-      vad?.stop()
-      diag.running = false
-    },
-    live: () => vad?.live() ?? false,
+    stop: () => engine.stop(),
+    live: () => (degraded ? engine.live() : (vad?.live() ?? false)),
   }
 }
 
