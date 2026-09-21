@@ -1,4 +1,6 @@
 import { create } from 'zustand'
+import { savedPersona, type PersonaId } from './lib/personas'
+import { savedAvatar, type AvatarId } from './lib/avatars'
 
 export type Phase =
   | 'offline'   // waiting for the click that unlocks audio
@@ -222,6 +224,21 @@ type State = {
   connected: string[]
   /** Name of the speech-synthesis voice in use, shown in the HUD. */
   voice: string
+  /** Which character the assistant currently is. Drives wake word, wordmark,
+   *  fillers, the dial word and the brain's system prompt. */
+  persona: PersonaId
+  /** Which core the assistant wears at the centre of the scene. The persona
+   *  is who the machine is; the avatar is what it looks like — the two are
+   *  independent on purpose. */
+  avatar: AvatarId
+  /** Whether the voice loop is actually hearing anything. False when the
+   *  microphone is refused or missing — the standby hint then points at the
+   *  typed command line instead of the wake word. */
+  voiceLive: boolean
+  /** Whether the clap detector is actually armed (microphone open). The
+   *  ignition screen and the standby hint only offer “or clap” when this is
+   *  true — a hint that cannot work is worse than none. */
+  clapLive: boolean
   /** Whether the camera is on and hands are being tracked. Store-backed rather
    *  than read off the tracker, because the indicator has to re-render. */
   gestures: boolean
@@ -242,6 +259,10 @@ type State = {
   ui: UiState
 
   setVoice: (v: string) => void
+  setPersona: (p: PersonaId) => void
+  setAvatar: (a: AvatarId) => void
+  setVoiceLive: (on: boolean) => void
+  setClapLive: (on: boolean) => void
   setGestures: (on: boolean) => void
   setLooking: (why: string | null) => void
   setBootNote: (n: string) => void
@@ -279,6 +300,10 @@ export const useStore = create<State>((set) => ({
   error: null,
   connected: [],
   voice: '',
+  persona: savedPersona(),
+  avatar: savedAvatar(),
+  voiceLive: true,
+  clapLive: false,
   gestures: false,
   looking: null,
   panels: [],
@@ -289,6 +314,10 @@ export const useStore = create<State>((set) => ({
   ui: defaultUi(),
 
   setVoice: (voice) => set({ voice }),
+  setPersona: (persona) => set({ persona }),
+  setAvatar: (avatar) => set({ avatar }),
+  setVoiceLive: (voiceLive) => set({ voiceLive }),
+  setClapLive: (clapLive) => set({ clapLive }),
   setGestures: (gestures) => set({ gestures }),
   setLooking: (looking) => set({ looking }),
   setBootNote: (bootNote) => set({ bootNote }),

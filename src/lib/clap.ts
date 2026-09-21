@@ -43,6 +43,10 @@ export type ClapListener = { stop: () => void }
 
 export const diag = {
   listening: false,
+  /** True when the analyser's AudioContext is autoplay-suspended — the mic is
+   *  open but the browser will not let the graph run until a gesture. Exposed
+   *  so the ignition hint never promises a clap that cannot be heard yet. */
+  suspended: false,
   claps: 0,
   lastPeak: 0,
   rejected: '',
@@ -54,23 +58,41 @@ if (typeof window !== 'undefined') {
 
 /**
  * Listen until told to stop. Resolves once the microphone is actually open, so
- * a caller can tell "not listening" from "listening and hearing nothing".
+ * a caller can tell "not listening" from "listening and hearing nothing" —
+ * and resolves null when the microphone was refused, so nobody downstream has
+ * to guess whether clap detection exists at all.
  *
  * Never throws for a refused microphone — clapping is an alternative to the
  * button, not a requirement, and an interface that reports an error about a
  * feature the user never asked for is worse than one that quietly does without.
  */
-export async function listenForClap(onClap: () => void): Promise<ClapListener> {
+export async function listenForClap(
+  onClap: () => void,
+): Promise<ClapListener | null> {
   let stream: MediaStream
   try {
     stream = await getMic()
   } catch {
     diag.rejected = 'microphone unavailable'
-    return { stop: () => {} }
+    return null
   }
 
   const ctx = new AudioContext()
   void ctx.resume()
+  // The one way this can still not work: the autoplay policy keeps the context
+  // suspended until a gesture (granting the mic usually unlocks it, but not
+  // always on the first visit). A suspended analyser reads pure silence — every
+  // clap invisible — so arm a one-tap revival and keep nudging it from the tick
+  // loop; whichever lands first wins, and the first click simply powers the
+  // machine up anyway.
+  const revive = () => {
+    if (ctx.state === 'suspended') void ctx.resume()
+  }
+  if (ctx.state === 'suspended') {
+    window.addEventListener('pointerdown', revive, { once: true })
+    window.addEventListener('keydown', revive, { once: true })
+    window.addEventListener('touchstart', revive, { once: true })
+  }
   const source = ctx.createMediaStreamSource(stream)
   const analyser = ctx.createAnalyser()
   // Small window: we are looking for an attack, and a long FFT smears exactly
@@ -85,6 +107,7 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
   let stopped = false
   let raf = 0
   let lastClap = 0
+  let lastReviveTry = 0
 
   /** A transient under examination, waiting to prove it decays. */
   let candidate: { at: number; peak: number } | null = null
@@ -99,6 +122,19 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
   const tick = () => {
     if (stopped) return
     raf = requestAnimationFrame(tick)
+
+    // A suspended graph hands the analyser an unbroken stream of zeros — every
+    // clap would sail past unheard. Keep the bookkeeping honest, keep nudging
+    // the context, and do not poison the silence floor with fake quiet.
+    diag.suspended = ctx.state === 'suspended'
+    if (ctx.state === 'suspended') {
+      const now = performance.now()
+      if (now - lastReviveTry > 2000) {
+        lastReviveTry = now
+        void ctx.resume()
+      }
+      return
+    }
 
     const now = performance.now()
     const level = rms()
@@ -152,7 +188,11 @@ export async function listenForClap(onClap: () => void): Promise<ClapListener> {
     stop: () => {
       stopped = true
       diag.listening = false
+      diag.suspended = false
       cancelAnimationFrame(raf)
+      window.removeEventListener('pointerdown', revive)
+      window.removeEventListener('keydown', revive)
+      window.removeEventListener('touchstart', revive)
       try {
         source.disconnect()
         // The shared microphone stream is NOT stopped here. It belongs to

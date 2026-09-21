@@ -70,9 +70,25 @@ export const BACKEND: 'bridge' | 'direct' = choice(
  * places that talk to it, so moving off the default port is a single edit.
  * `wss://` maps to `https://` on its own, which is why this is a prefix swap
  * rather than a hardcoded scheme.
+ *
+ * Set VITE_BRIDGE_URL=same-origin to derive everything from the page's own
+ * origin — the bridge is then reached through whatever fronts the page (a
+ * gateway, a proxy, or the bridge serving the app itself), and the websocket
+ * lands on the /ws path.
  */
-export const BRIDGE_WS_URL = str(import.meta.env.VITE_BRIDGE_URL) ?? 'ws://localhost:8787'
-export const BRIDGE_HTTP_URL = BRIDGE_WS_URL.replace(/^ws/, 'http')
+function sameOriginBridge(): string | undefined {
+  if (typeof window === 'undefined') return undefined
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${proto}://${window.location.host}/ws`
+}
+
+export const BRIDGE_WS_URL =
+  str(import.meta.env.VITE_BRIDGE_URL) === 'same-origin'
+    ? (sameOriginBridge() ?? 'ws://localhost:8787')
+    : (str(import.meta.env.VITE_BRIDGE_URL) ?? 'ws://localhost:8787')
+
+/** Same scheme swap, plus dropping the /ws path the socket form carries. */
+export const BRIDGE_HTTP_URL = BRIDGE_WS_URL.replace(/^ws/, 'http').replace(/\/ws$/, '')
 
 /**
  * Speech output engine.

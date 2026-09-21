@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useStore } from '../store'
+import { personaById } from '../lib/personas'
 
 /**
  * Rotating example commands, shown only while idle.
@@ -29,6 +30,7 @@ const ROTATE_MS = 4200
 export function Suggestions() {
   const phase = useStore((s) => s.phase)
   const turns = useStore((s) => s.turns)
+  const persona = useStore((s) => s.persona)
   const [i, setI] = useState(0)
 
   useEffect(() => {
@@ -39,6 +41,8 @@ export function Suggestions() {
   // Only while genuinely idle, and only until the first exchange — once the
   // user knows how it works, the prompt is just clutter.
   if (phase !== 'dormant' || turns.length > 0) return null
+
+  const wake = personaById(persona).wake
 
   return (
     <div className="suggest">
@@ -52,7 +56,7 @@ export function Suggestions() {
           exit={{ opacity: 0, y: -6 }}
           transition={{ duration: 0.35 }}
         >
-          “hey jarvis, {EXAMPLES[i]}”
+          “{wake}, {EXAMPLES[i]}”
         </motion.span>
       </AnimatePresence>
     </div>

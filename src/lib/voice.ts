@@ -3,6 +3,7 @@ import { getMic } from './audio'
 import { speakingNow, speakingSince } from './tts'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
+import { personaById, savedPersona, wakeRegex } from './personas'
 
 /**
  * The voice loop.
@@ -65,20 +66,27 @@ export type Voice = {
 const WAKE_DEBOUNCE = 1500
 
 /**
- * His name, and the only wake phrase.
+ * The name, and the only wake phrase — a function of the persona.
  *
- * The optional prefix is genuinely optional: addressing him by name alone is
- * correct, and during an answer "Jarvis" on its own is the natural way to cut
- * in. The negative lookahead keeps possessives ("Jarvis's job") from waking him.
+ * The optional prefix is genuinely optional: addressing the assistant by name
+ * alone is correct, and during an answer the bare name is the natural way to
+ * cut in. The negative lookahead keeps possessives ("Sofia's job") from
+ * waking the machine.
  *
- * The alternates are not padding. "Jarvis" is not in a general dictation
- * model's high-frequency vocabulary, and Chrome routinely returns Travis,
- * Jervis, Jarvys or Java's for a perfectly clear utterance — every one of which
- * used to be silently discarded, so the wake word "just didn't work" with no
- * indication why. Better a rare false wake than a name that does not answer.
+ * The alternates are not padding. None of these names is in a general
+ * dictation model's high-frequency vocabulary, and Chrome routinely returns
+ * Sophia for Sofia, Travis for Jarvis and Novera for Nova on a perfectly
+ * clear utterance — every one of which used to be silently discarded, so the
+ * wake word "just didn't work" with no indication why. Better a rare false
+ * wake than a name that does not answer.
  */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+let WAKE = wakeRegex(personaById(savedPersona()))
+
+/** Swap the wake word — call whenever the persona changes, and before the
+ *  voice loop starts. */
+export function setWakePersona(personaId: string): void {
+  WAKE = wakeRegex(personaById(personaId))
+}
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
@@ -391,10 +399,14 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
     await getMic()
   } catch (err) {
     diag.lastError = 'mic'
+    // The common case is not a machine without a microphone — it is an
+    // embedded preview pane, which the browser will not even prompt for. The
+    // message has to say what to DO, or "hey sofia" just stops working with no
+    // hint that the command line is still live.
     h.onError(
       err instanceof DOMException && err.name === 'NotAllowedError'
-        ? 'Microphone access denied — voice input is unavailable.'
-        : 'No microphone available.',
+        ? 'Microphone is blocked in this pane — open the page in its own browser tab to talk, or type a command below.'
+        : 'No microphone available — voice input is off; the command line below still works.',
     )
     return { stop: () => {}, live: () => false }
   }

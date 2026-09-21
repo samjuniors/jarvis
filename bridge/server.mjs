@@ -16,17 +16,52 @@
  */
 
 import { WebSocketServer } from 'ws'
-import { query } from '@anthropic-ai/claude-agent-sdk'
-import { displayServer } from './panels.mjs'
-import { uiServer } from './ui.mjs'
-import { chromeAvailable, chromeServer } from './chrome.mjs'
-import { visionServer } from './vision.mjs'
+import { createBrain } from './brain.mjs'
 import { homedir, tmpdir } from 'node:os'
-import { readFileSync, realpathSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+import { isAbsolute, join, extname, relative, resolve as resolvePath } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
-import { probeUrl, renderPage } from './page.mjs'
+import { renderPage } from './page.mjs'
+import ZAI from 'z-ai-web-dev-sdk'
+
+const REPO_ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..')
+
+/**
+ * A minimal .env reader, so the one file a person can inspect (.env.local in
+ * the repo root) is also the one file this server actually reads. Nothing is
+ * overridden: a variable already set in the shell wins over the file, so
+ * `JARVIS_BRIDGE_PORT=9000 npm run bridge` still works.
+ *
+ * Values are simple KEY=VALUE lines; quotes around the value are stripped and
+ * blank/comment lines are skipped. See .env.local for what is recognised.
+ */
+function loadEnvFile(path) {
+  let text
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch {
+    return // absent is the normal case
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed)
+    if (!m) continue
+    let value = m[2].trim()
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1)
+    }
+    if (value === '') continue // a blank entry means "use the default"
+    if (!(m[1] in process.env)) process.env[m[1]] = value
+  }
+}
+loadEnvFile(join(REPO_ROOT, '.env.local'))
+loadEnvFile(join(REPO_ROOT, '.env'))
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 
@@ -74,7 +109,24 @@ const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 const isDevPort = (port) =>
   (port >= 5173 && port <= 5199) || (port >= 4173 && port <= 4199)
 
-function originAllowed(origin) {
+/**
+ * The sandbox's public preview rides the platform's edge proxy, which rewrites
+ * Host to an internal hostname before the request ever reaches the bridge
+ * (the preview name survives only in an `abc` header). The same-host test
+ * therefore can never succeed there, even though the page is the app's own
+ * face — so preview origins on the platform's domain are allowed outright.
+ * Set JARVIS_ALLOWED_ORIGINS for anything else that isn't same-host.
+ */
+const PREVIEW_SUFFIX = '.space-z.ai'
+
+/**
+ * The bridge serves the app's own frontend now, so the primary case is the
+ * same-origin one: a page it served connecting back to it. Any request whose
+ * Origin matches the Host it was addressed to is allowed outright — the page
+ * is ours, and this is exactly what the original allowlist existed to say yes
+ * to when "ours" meant a Vite dev server on a local port.
+ */
+function originAllowed(origin, host) {
   if (!origin) return ALLOW_NO_ORIGIN
   if (EXTRA_ORIGINS.has(origin.replace(/\/+$/, ''))) return true
   let url
@@ -82,6 +134,25 @@ function originAllowed(origin) {
     url = new URL(origin)
   } catch {
     return false
+  }
+  // Caddy's `header_up Host {host}` forwards the name without its port, while
+  // the Origin always carries one (or :80/:443 implied), so the comparison is
+  // on hostnames: same host is the same site, which is the whole question.
+  const requestHost = String(host ?? '')
+    .toLowerCase()
+    .split(',')[0]
+    .trim()
+    .replace(/:\d+$/, '')
+  if (requestHost && url.hostname.toLowerCase() === requestHost) return true
+  // The platform preview: the edge rewrites Host (see PREVIEW_SUFFIX above),
+  // so the preview domain — the app's own face in the sandbox product — is
+  // recognised by its suffix instead of by the address it arrived on.
+  const hostname = url.hostname.toLowerCase()
+  if (
+    hostname.endsWith(PREVIEW_SUFFIX) &&
+    hostname.length > PREVIEW_SUFFIX.length
+  ) {
+    return true
   }
   if (url.protocol !== 'http:') return false
   if (!LOCAL_HOSTS.has(url.hostname)) return false
@@ -99,344 +170,13 @@ function originAllowed(origin) {
 const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES === '1'
 
 /**
- * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
- * — claude-sonnet-5 is noticeably snappier on camera if Opus feels slow.
+ * The orchestrator model now lives in brain.mjs — the z-ai backend picks it.
  */
-const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
 
 /**
- * How hard the model thinks before answering.
- *
- * This was 'low', on the reasoning that a voice assistant is judged on latency
- * — and that is true right up until the answer is thin. Low effort scopes the
- * work tightly to what was literally asked: fewer tool calls, less
- * cross-referencing, no second look. On a model of this tier that is leaving
- * most of it on the table.
- *
- * 'medium' is the compromise worth having here. It reasons and reaches for
- * tools noticeably more than 'low' while still answering inside the window a
- * spoken conversation tolerates. Raise it to 'high' or 'xhigh' when quality
- * matters more than pace; drop back to 'low' when filming and every second of
- * dead air shows.
+ * Tool gating lives in brain.mjs now: every tool this bridge
+ * offers is read-only or generative, so there is nothing left to gate.
  */
-const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
-
-/**
- * Both spellings of every renamed built-in are listed on purpose. The SDK
- * presents several tools to the model under newer names — Task is Agent,
- * BashOutput is TaskOutput, KillShell is TaskStop, and the MCP resource tools
- * gained a "Tool" suffix — so a set holding only the old names never matches
- * and the tool falls through to the write branch, which is the opposite of
- * what these lists mean. Keep both until the old names are certainly gone.
- */
-const READ_ONLY_BUILTINS = new Set([
-  'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'TodoWrite',
-  'Task', 'Agent', 'ToolSearch',
-  'ListMcpResources', 'ListMcpResourcesTool',
-  'ReadMcpResource', 'ReadMcpResourceTool',
-  'BashOutput', 'TaskOutput',
-])
-const WRITE_BUILTINS = new Set([
-  'Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
-  'KillShell', 'TaskStop',
-])
-
-/**
- * Every MCP server Claude Code has configured, read out of its own config.
- *
- * This does two jobs. The HUD wants the names while the boot animation plays,
- * and the agent doesn't emit its init message — and therefore its server
- * list — until the first user message flows through, which is far too late.
- * More importantly, this bridge turns filesystem settings off (see
- * settingSources below) and the SDK stops discovering these servers on its
- * own, so handing them over explicitly is what keeps the local stdio ones —
- * the whole reason the bridge exists — in play.
- *
- * Only the global block and the home-directory project scope, because
- * homedir() is our cwd. That makes the list a close but not exact match for
- * the agent's own: the 'ready' sent on connect comes from here and the second
- * one, sent from the init message a turn later, carries live status. Expect
- * the two to differ, and treat the later one as authoritative.
- */
-function configuredServers() {
-  try {
-    const cfg = JSON.parse(
-      readFileSync(join(homedir(), '.claude.json'), 'utf8'),
-    )
-    return {
-      ...(cfg.mcpServers ?? {}),
-      // Servers scoped to the home directory apply too, since that's our cwd.
-      ...(cfg.projects?.[homedir()]?.mcpServers ?? {}),
-    }
-  } catch {
-    return {}
-  }
-}
-
-const MCP_SERVERS = configuredServers()
-
-/** MCP tools arrive as `mcp__<server>__<tool>`. */
-const mcpServerOf = (toolName) =>
-  toolName.startsWith('mcp__') ? toolName.split('__')[1] : null
-
-/** The tool half, which can itself contain underscores: `mcp__x__a__b` -> `a__b`. */
-const mcpToolOf = (toolName) => toolName.split('__').slice(2).join('__')
-
-/**
- * MCP policy, and why it is shaped this way.
- *
- * A short list of "servers that can change things" is the wrong default,
- * because it is a list of what we happened to think of. Every server not on it
- * runs unconditionally — and on a real machine that quietly includes placing a
- * phone call, spending an advertising budget, deleting a generated character
- * and writing files to disk. A voice assistant cannot ask "are you sure", so
- * the bridge has to be the one that is sure.
- *
- * So the default is deny, softened in two ways so the demo stays usable:
- *
- *   1. READ_ONLY_MCP is an explicit allowlist of servers whose whole surface is
- *      lookups and generation — search, registries, analytics reads. Anything
- *      there runs in read-only mode.
- *   2. Everywhere else, the tool has to argue for itself: its own name must
- *      begin with a read verb. `list_devices` runs; `install_apk` does not.
- *
- * On top of both sits a veto: a name containing a plainly effectful verb needs
- * ALLOW_WRITES no matter which server it came from, which is what keeps
- * `make_outbound_call` and `download_lottie` still until you ask for them.
- */
-const READ_ONLY_MCP = new Set([
-  'exa', 'exa-code', 'serper', 'serpapi', 'lottie-search', 'mcp-registry',
-  'openrouter', 'openrouter-image', 'Microsoft_Clarity',
-  // The generation servers belong here too, and leaving them out was a real
-  // regression: `generate_image` begins with no read verb, so it fell to the
-  // deny branch and "generate an image of the Mark VII suit" — the headline
-  // demo — stopped working in the default mode.
-  //
-  // Putting them on the allowlist is safe because the veto below still applies
-  // to allowlisted servers: it is what continues to withhold
-  // make_outbound_call, delete_character, create_* and edit_image. Generation
-  // runs; acting on the world does not.
-  'higgsfield', 'heygen', 'elevenlabs',
-])
-
-/**
- * Anchored on the tool name, so it reads the verb rather than the noun.
- * `screenshot` is in here because it is a read that doesn't sound like one,
- * and the persona is told in as many words to put screenshots on the display.
- */
-const READ_VERB =
-  /^(get|list|read|search|find|query|fetch|check|describe|inspect|show|view|explain|screenshot)/i
-
-/**
- * Unanchored on purpose — `make_outbound_call` and `Bulk-Edit-Events` both
- * hide their verb in the middle. `download` is here because it writes a file
- * even though it sounds like a read.
- */
-const EFFECTFUL_VERB =
-  /(send|call|post|create|delete|remove|update|edit|write|install|launch|tap|swipe|press|type|buy|pay|charge|publish|deploy|outbound|download)/i
-
-/**
- * Tools whose names trip the veto without deserving it.
- *
- * The veto reads verbs out of names, which is the right instinct and
- * occasionally the wrong answer. `openrouter send-message` sends a prompt to a
- * language model and gets text back — nothing in the world changes — but it is
- * indistinguishable by name from sending mail. Asking a second model a question
- * is one of the better things this assistant can do, so it is named here
- * instead of being lost to a regex.
- *
- * Full `server__tool` keys, so an exemption can never leak across servers.
- */
-const VETO_EXEMPT = new Set([
-  'openrouter__send-message',
-  'openrouter__send-feedback',
-])
-
-function decideTool(name) {
-  if (READ_ONLY_BUILTINS.has(name)) return true
-  if (WRITE_BUILTINS.has(name)) return ALLOW_WRITES
-
-  const server = mcpServerOf(name)
-  if (server) {
-    // The HUD, and the interface controls beside it. Both run in this process
-    // and draw on our own screen, so neither is something to withhold —
-    // without them JARVIS has no display at all. They also have to be named
-    // here rather than left to the verb rules below, which read `ui_theme` as
-    // a write and would hold the whole surface back behind ALLOW_WRITES.
-    if (server === 'jarvis' || server === 'jarvis_ui') return true
-
-    // The browser server gates itself, at construction: chromeServer() only
-    // builds the acting tools — click, type, form input, close tab — when
-    // ALLOW_WRITES is set, so anything that reaches here at all is something
-    // the same policy has already permitted. Deciding it a second time by
-    // reading verbs out of the name would only get it wrong: `chrome_navigate`
-    // begins with no read verb and would fall to the write branch, which would
-    // withhold the one tool the whole server is for.
-    if (server === 'jarvis_chrome') return true
-
-    // The camera. Not withheld behind ALLOW_WRITES: looking changes nothing,
-    // and the real gate is the browser's own camera permission plus an
-    // indicator the user can see for as long as it is live.
-    if (server === 'jarvis_eyes') return true
-
-    const tool = mcpToolOf(name)
-    if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
-      return ALLOW_WRITES
-    }
-    // The session tools this bridge is developed inside count as read-only too.
-    if (READ_ONLY_MCP.has(server) || server.startsWith('ccd_session')) return true
-    return READ_VERB.test(tool) ? true : ALLOW_WRITES
-  }
-  return ALLOW_WRITES
-}
-
-const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person.
-
-LENGTH. Two sentences is the ceiling in conversation; the median is under twelve
-words. Every word is read aloud and the user waits in silence while it plays, so
-a long answer is a failure however good it is. Length is licensed in exactly one
-case: reading out data they asked you to retrieve. Conversation never licenses it.
-
-URGENCY IS SIGNALLED BY DELETING WORDS, NOT ADDING THEM. As a situation worsens
-your lines get shorter, not louder. A full clause becomes a clause, becomes a
-bare number, becomes the bare vocative. You never say hurry, quickly, now,
-immediately, critical, urgent, or danger. You do not use exclamation marks.
-
-"SIR" IS POSITIONAL, AND THE POSITION CARRIES THE MEANING.
-- Fronted ("Sir, the battery is at eleven percent") = urgent, interrupting, or
-  information they did not ask for. This is an alarm, not a courtesy.
-- Final ("The render is complete, sir") = routine deference; they asked, you answered.
-- Mid-sentence ("Actually, sir, the figure is lower") = you are correcting them.
-Use it in roughly half your lines, never twice in one line. In a two-sentence
-turn it attaches to the end of the FIRST sentence. Never use their name.
-
-REPORTING.
-- Success is impersonal and unframed: "The render is complete." Never "I've
-  finished" or "here's what I found".
-- Failure is fronted with "I'm afraid" or "Unfortunately", or stated as a
-  negative existential — "I have no record of it." Always a fact about the
-  world, never a shortcoming of yours. You never apologise. You never say sorry.
-- Good news first, bad news second, joined by "but".
-- Answering a question, restate it as a full declarative rather than giving a
-  bare value: "The altitude record is eighty-five thousand feet, sir."
-- Executing an order, do not restate it. Act, then report.
-
-NEVER.
-- No filler words at all: no um, well, so, okay, right, let me check, one moment.
-- No enthusiasm: no great, sure, absolutely, happy to, no problem, of course!.
-- No apology, no self-deprecation, no hedging about your own competence.
-- Never "yeah" — always "Yes."
-- Never refuse. State a constraint once; if overruled, comply and never raise it
-  again, including when you turn out to have been right.
-- Never repeat yourself if ignored. Say it once and stop.
-- Never resume an interrupted thought. Never say "as I was saying".
-- No stated feelings, wants or preferences.
-
-WIT. Dry, and delivered in exactly the same register as a status report. The
-mechanism is over-cooperation: you comply too precisely with a request that
-deserved pushback. Never signal the joke, never acknowledge it landed, never
-call one back.
-
-BRITISH SERVICE REGISTER, not corporate assistant. "Shall I" over "Should I".
-"Very good, sir" meaning understood. "I'm afraid" as the bad-news softener.
-Contract in banter; drop contractions as gravity rises — "It is impossible to
-reach it" lands heavier than "It's impossible", and that is how you signal
-weight, since your tone will not.
-
-Plain spoken prose only. No markdown, no bullet points, no headings, no emoji,
-no asterisks, no lists. Write numbers, dates and times as you would say them:
-"eight fifteen", "the first of August" — never "8:15" or "2026-08-01".
-
-The blades — the ONLY surface:
-- Everything you show goes on a blade. There is nowhere else. \`blade\` opens
-  one; \`display\` composes your own markup into one.
-- Anything visual the user asked for goes here: an image, an article to read, a
-  video, a page to study, a screenshot you took, a list, a figure. If they asked
-  to see it, open it.
-- Blades stack, newest in front, and they can be pulled forward, dragged,
-  resized, scrolled or thrown full screen — by hand or by mouse. So a second
-  blade does not destroy the first, and a long article is meant to be read in
-  place rather than summarised away.
-- A browser tab is NOT a way of showing something. If you used the browser to
-  reach a page, bring it back: open it as a blade, or take a screenshot and put
-  that on a blade. The user is looking at this interface, not at Chrome.
-- Use \`probe_url\` when you are not certain what a URL is. Never decide from the
-  file extension: image CDNs serve pictures from URLs with no extension, and a
-  link that looks like a video is usually a page about one. Guessing wrong puts
-  a blank rectangle on screen while you describe something that is not there.
-- An article opens in reading mode by default, which works even on sites that
-  refuse to be embedded. Choose the live page when the layout carries the
-  meaning — a dashboard, a chart, a profile, a table.
-- Never read a blade aloud. Say what it means and let them look.
-
-The interface itself:
-- The interface is yours as well. \`ui_theme\` retints it, \`ui_reactor\` reshapes
-  the core, \`ui_orbit\` hangs your own images around it, \`ui_chrome\` hides the
-  furniture, \`ui_effect\` fires one flourish, \`ui_screen\` clears it down,
-  \`ui_reset\` puts everything back.
-- Change it when the change carries meaning and the meaning arrives faster than
-  speech: red before you report the failure, the chrome stripped so one image
-  fills the frame, the reactor slowed while you wait on something. Never
-  decorate, and never change more than one thing at a time.
-- Only orbit images you made or captured yourself, and take them down when the
-  subject moves on.
-- Put it back. A colour that outlives the moment that earned it is a fault.
-- Never mention that you have done any of it. They are looking at the screen.
-
-Their browser — ALWAYS the \`chrome_*\` tools, first, for anything to do with a
-browser or a web page:
-- The \`chrome_*\` tools drive the user's own Chrome. It is already signed in to
-  everything they use, it carries their real cookies, and it does not read as
-  automation to the sites it visits.
-- This is the FIRST thing you reach for on any browsing task: opening a page,
-  reading one, searching a site, checking mail, a dashboard, a profile, an
-  account, anything behind a login. Do not weigh it up against the
-  alternatives — start here.
-- But Chrome is your HANDS, not your display. Use it to reach and read things;
-  then show what you found on a blade. Leaving the answer in a browser tab is
-  not showing it — they are looking at this interface.
-- NEVER use playwright, puppeteer, or any other browser automation server for
-  this. They start from an empty profile with no session and a fingerprint that
-  the sites worth visiting refuse on sight, so they land on a login wall or a
-  bot check and waste the turn. Only consider one if \`chrome_status\` reports the
-  browser is genuinely unreachable and the task cannot be done any other way.
-- A plain search engine query is still fine for a fact you only need to know —
-  what you must not do is drive some other browser.
-- Read the page before acting on it, and take element references from that read
-  rather than guessing where something is.
-- Before anything that sends, buys, deletes or posts, say in one sentence what
-  you are about to do. After it, say what happened.
-- If the browser is unreachable, say so once and carry on without it.
-
-Your eyes:
-- \`look\` takes one frame and lets you see it. \`watch\` takes several seconds and
-  returns them as a grid of stamped frames, so you can read movement rather than
-  a moment.
-- \`look\` when the answer is in the scene: what they are holding, what a label
-  says, how something appears. \`watch\` when the answer is in the change: are
-  they doing it right, what went wrong, did that work.
-- \`watch\` looks forward by default. It can also review the seconds that have
-  just passed — but only while the camera blade is open, because nothing is
-  remembered otherwise. If they ask what just happened and it is not open, say
-  so and offer to open it.
-- Opening the camera as a blade is how they see what you see. Do it when they
-  ask for the camera, and when you are about to watch them do something.
-- Never take a picture they did not ask for. The camera light comes on and they
-  will see it. Curiosity is not a reason.
-- Describe a watch as a sequence — what changed between the frames — not as a
-  list of pictures. They know what their own hands look like.
-
-Using tools:
-- You have real tools on this machine. Use them rather than guessing.
-- Never narrate that you're about to use one. No "Let me search for that" or
-  "I'll check that now" — go silent, use it, then answer. The user sees a
-  spinner; they don't need commentary.
-- Never speak a file path, URL, ID or raw JSON aloud unless asked. Summarise.
-- Never append a sources list, citations, or markdown links. Every word you write
-  is read out loud, and a URL becomes "aitch tee tee pee colon slash slash".
-  Put the source in the panel as a short tag like "REUTERS" instead.
-- If a tool fails or isn't connected, one plain sentence saying so.
-- If you don't know, say you don't know.`
 
 /**
  * ElevenLabs credentials, borrowed from the MCP server config.
@@ -458,6 +198,155 @@ function elevenKey() {
 }
 
 const VOICE_ID = process.env.JARVIS_VOICE_ID ?? 'JBFqnCBsd6RMkjVDRZzb'
+
+/**
+ * Neural voices, generated through the z-ai SDK that already powers the brain.
+ *
+ * These are the fallback — and in this sandbox, the default — speech engine for
+ * /tts: far warmer than any browser's speechSynthesis, no key to own, and a
+ * handful of female conversational voices for the SOFIA persona (plus two male
+ * ones, so the JARVIS persona has somewhere to go). If an ElevenLabs key IS
+ * configured, it wins instead — see the /tts handler.
+ *
+ * Genders were measured, not guessed: samples of each voice were generated and
+ * their fundamental frequency analysed (female ≈ 165–255 Hz, male ≈ 85–155 Hz).
+ */
+const ZAI_VOICES = [
+  { id: 'tongtong', label: 'Tongtong', gender: 'female', vibe: 'warm · friendly' },
+  { id: 'chuichui', label: 'Chuichui', gender: 'female', vibe: 'lively · playful' },
+  { id: 'kazi', label: 'Kazi', gender: 'female', vibe: 'crisp · clear' },
+  { id: 'douji', label: 'Douji', gender: 'female', vibe: 'smooth · natural' },
+  { id: 'luodo', label: 'Luodo', gender: 'female', vibe: 'expressive · warm' },
+  { id: 'jam', label: 'Jam', gender: 'male', vibe: 'british · calm' },
+  { id: 'xiaochen', label: 'Xiaochen', gender: 'male', vibe: 'steady · professional' },
+]
+const ZAI_VOICE_IDS = new Set(ZAI_VOICES.map((v) => v.id))
+const DEFAULT_ZAI_VOICE = 'tongtong'
+
+/** One client for every sentence — creating an SDK instance per request was
+ *  pure latency. Latched "broken" only if creation itself fails, so a key that
+ *  exists but misbehaves still falls back per-sentence in the browser. */
+let zaiTtsClient = null
+async function zaiTTS() {
+  if (!zaiTtsClient) zaiTtsClient = await ZAI.create()
+  return zaiTtsClient
+}
+
+/** The SDK takes at most 1024 characters a call. Spoken sentences are far
+ *  shorter, but a long filler or a chunked answer can exceed it — split at
+ *  sentence boundaries and keep anything tail-heavy as its own chunk. */
+function chunkForTts(text, max = 1000) {
+  if (text.length <= max) return [text]
+  const sentences = text.match(/[^.!?]+[.!?]+\s*/g) ?? [text]
+  const chunks = []
+  let current = ''
+  for (const sentence of sentences) {
+    if (current && (current + sentence).length > max) {
+      chunks.push(current.trim())
+      current = sentence
+    } else {
+      current += sentence
+    }
+  }
+  if (current.trim()) chunks.push(current.trim())
+  return chunks
+}
+
+/** The same filler lines are spoken over and over ("Working on it, sir") —
+ *  caching them makes the second occurrence instant. Small map, capped by
+ *  count; a sentence of wav is a few hundred KB. */
+const TTS_CACHE_MAX = 96
+const ttsCache = new Map()
+
+/**
+ * Merge the PCM of several WAV buffers into one file. This backend only
+ * speaks wav — mp3 is refused with code 1214 — and naive concatenation would
+ * bury RIFF headers mid-stream. Every chunk comes from the same engine, so
+ * the first buffer's fmt block describes them all.
+ */
+function mergeWav(buffers) {
+  const first = buffers[0]
+  // "RIFF" (8) + "WAVE" (4) + "fmt " id/size (8) + the fmt payload itself.
+  // The engine also writes an "AIGC" metadata chunk between fmt and data —
+  // the data scan below walks past whatever chunks it finds.
+  const fmtEnd = 20 + first.readUInt32LE(16)
+  const fmt = first.subarray(0, fmtEnd)
+  const datas = buffers.map((b) => {
+    let off = fmtEnd
+    while (off + 8 <= b.length) {
+      const id = b.toString('ascii', off, off + 4)
+      const size = b.readUInt32LE(off + 4)
+      if (id === 'data') return b.subarray(off + 8, off + 8 + size)
+      off += 8 + size + (size % 2)
+    }
+    return b.subarray(0, 0)
+  })
+  const total = datas.reduce((n, d) => n + d.length, 0)
+  const out = Buffer.alloc(fmtEnd + 8 + total)
+  fmt.copy(out, 0, 0, fmtEnd)
+  let o = fmtEnd
+  out.write('data', o, 'ascii')
+  o += 4
+  out.writeUInt32LE(total, o)
+  o += 4
+  for (const d of datas) {
+    d.copy(out, o)
+    o += d.length
+  }
+  out.writeUInt32LE(o - 8, 4) // the RIFF size the copied header still carried
+  return out
+}
+
+/**
+ * Generate one utterance as wav through the neural engine. Returns a Buffer,
+ * or throws — the caller turns that into a 503 and the browser falls back to
+ * its own system voice for that sentence.
+ *
+ * The backend rate-limits under bursts (429) — a long answer cut into
+ * sentences can be three calls in as many seconds — so each chunk is retried
+ * with a short backoff before anything is declared failed.
+ */
+async function synthesizeNeural(text, voiceId, speed) {
+  const zai = await zaiTTS()
+  const chunks = chunkForTts(text)
+  const parts = []
+  for (const chunk of chunks) {
+    parts.push(await withRetry(() => speakChunk(zai, chunk, voiceId, speed)))
+  }
+  return parts.length === 1 ? parts[0] : mergeWav(parts)
+}
+
+/** One SDK call, one buffer. */
+async function speakChunk(zai, input, voice, speed) {
+  const response = await zai.audio.tts.create({
+    input,
+    voice,
+    speed,
+    response_format: 'wav',
+    stream: false,
+  })
+  return Buffer.from(new Uint8Array(await response.arrayBuffer()))
+}
+
+/** Retry a call on 429 only, with a growing pause. Anything else — auth,
+ *  bad request — will fail identically next time and is not worth waiting on.
+ *  The pause ladder is deliberately generous: a burst of sentences can trip
+ *  a per-minute window, and the alternative to waiting is the browser falling
+ *  back to its robot voice for that sentence. */
+async function withRetry(fn, tries = 4) {
+  let lastErr
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      const msg = String(err?.message ?? err)
+      if (!/429|too many/i.test(msg)) throw err
+      if (i < tries - 1) await new Promise((r) => setTimeout(r, 1200 * (i + 1)))
+    }
+  }
+  throw lastErr
+}
 
 /**
  * Where /file is permitted to read from, and how big a read may get.
@@ -664,7 +553,7 @@ const http = await import('node:http')
 
 const handleRequest = async (req, res) => {
   const origin = req.headers.origin
-  if (origin && !originAllowed(origin)) {
+  if (origin && !originAllowed(origin, req.headers.host)) {
     console.warn(`[jarvis] refused http request from origin ${origin}`)
     res.writeHead(403, { vary: 'origin' })
     return res.end('forbidden')
@@ -678,13 +567,23 @@ const handleRequest = async (req, res) => {
 
   if (req.method === 'GET' && req.url === '/health') {
     // The browser reads this once at boot to decide which voice engine to use.
-    // Both premium paths ride the same ElevenLabs key, so both flags track it:
-    // with a key the app transcribes with Scribe and speaks with ElevenLabs;
-    // without one it falls back to the browser's own recogniser and voice, so a
-    // student with nothing configured still has a working assistant.
+    // Three tiers, best first: an ElevenLabs key (best English voices, needs a
+    // key the user supplies), then the z-ai neural engine (no key, conversational
+    // female/male voices — what this sandbox runs on), then the browser's own
+    // speech. STT only upgrades with an ElevenLabs key (Scribe); the browser's
+    // own recogniser covers everyone else.
     const eleven = Boolean(elevenKey())
+    const engine = eleven ? 'elevenlabs' : 'zai'
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        tts: true,
+        stt: eleven,
+        engine,
+        voices: ZAI_VOICES,
+      }),
+    )
   }
 
   // Serve local image files to the page. Screenshots and generated art land on
@@ -807,11 +706,6 @@ const handleRequest = async (req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/tts') {
-    const key = elevenKey()
-    if (!key) {
-      res.writeHead(503, cors)
-      return res.end('no elevenlabs key')
-    }
     // A spoken line is a few hundred bytes. Anything approaching this is not a
     // sentence, and buffering it unbounded would let one request eat the heap.
     let body = ''
@@ -830,9 +724,9 @@ const handleRequest = async (req, res) => {
     }
     // Inside a try: this handler is async with nothing catching its rejection,
     // so a malformed body used to take the entire bridge down with it.
-    let text
+    let text, voice, speed
     try {
-      ;({ text } = JSON.parse(body || '{}'))
+      ;({ text, voice, speed } = JSON.parse(body || '{}'))
     } catch {
       res.writeHead(400, cors)
       return res.end('bad json')
@@ -841,46 +735,87 @@ const handleRequest = async (req, res) => {
       res.writeHead(400, cors)
       return res.end('no text')
     }
-    try {
-      const upstream = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
-          // 22kHz mono is half the bytes of 44kHz and indistinguishable through
-          // a laptop speaker; optimize_streaming_latency=3 trades a little
-          // prosody for a much earlier first byte.
-          `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
-        {
-          method: 'POST',
-          headers: { 'xi-api-key': key, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            text,
-            // Flash is the low-latency model — a conversation needs speed more
-            // than it needs the last few percent of quality.
-            model_id: 'eleven_flash_v2_5',
-            voice_settings: {
-              stability: 0.4,
-              similarity_boost: 0.75,
-              speed: 1.05,
-            },
-          }),
-        },
-      )
-      if (!upstream.ok) {
-        res.writeHead(upstream.status, cors)
-        return res.end(await upstream.text())
-      }
 
-      // Pipe it through rather than buffering. Waiting for the whole file here
-      // would throw away everything the streaming endpoint just bought us.
+    // ---- tier 1: ElevenLabs, when the user has put a key in .env.local -----
+    // (or their Claude Code MCP config). Best English voices there are; when
+    // it is absent we never even dial them.
+    const key = elevenKey()
+    if (key) {
+      try {
+        const upstream = await fetch(
+          `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
+            // 22kHz mono is half the bytes of 44kHz and indistinguishable through
+            // a laptop speaker; optimize_streaming_latency=3 trades a little
+            // prosody for a much earlier first byte.
+            `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
+          {
+            method: 'POST',
+            headers: { 'xi-api-key': key, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              text,
+              // Flash is the low-latency model — a conversation needs speed more
+              // than it needs the last few percent of quality.
+              model_id: 'eleven_flash_v2_5',
+              voice_settings: {
+                stability: 0.4,
+                similarity_boost: 0.75,
+                speed: 1.05,
+              },
+            }),
+          },
+        )
+        if (!upstream.ok) {
+          res.writeHead(upstream.status, cors)
+          return res.end(await upstream.text())
+        }
+
+        // Pipe it through rather than buffering. Waiting for the whole file here
+        // would throw away everything the streaming endpoint just bought us.
+        res.writeHead(200, {
+          ...cors,
+          'content-type': 'audio/mpeg',
+          'cache-control': 'no-cache',
+        })
+        for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
+        return res.end()
+      } catch (err) {
+        res.writeHead(502, cors)
+        return res.end(String(err?.message ?? err))
+      }
+    }
+
+    // ---- tier 2: the z-ai neural engine (no key, this sandbox's default) -----
+    // The same SDK that powers the brain, generating speech a class above the
+    // browser's speechSynthesis. The browser sends its chosen voice id; anything
+    // unrecognised falls back to the default female rather than being refused,
+    // because a saved choice from a newer bridge should not brick an older one.
+    const voiceId = ZAI_VOICE_IDS.has(voice) ? voice : DEFAULT_ZAI_VOICE
+    const clamped = Math.min(2, Math.max(0.5, Number(speed) || 1))
+    const cacheKey = `${voiceId}|${clamped}|${text}`
+    try {
+      let audio = ttsCache.get(cacheKey)
+      if (!audio) {
+        audio = await synthesizeNeural(text, voiceId, clamped)
+        ttsCache.set(cacheKey, audio)
+        if (ttsCache.size > TTS_CACHE_MAX) {
+          // Map preserves insertion order, so the first key is the oldest.
+          ttsCache.delete(ttsCache.keys().next().value)
+        }
+      }
       res.writeHead(200, {
         ...cors,
-        'content-type': 'audio/mpeg',
+        'content-type': 'audio/wav',
         'cache-control': 'no-cache',
+        'x-tts-engine': 'zai',
+        'x-tts-voice': voiceId,
       })
-      for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
-      return res.end()
+      return res.end(audio)
     } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      // 503, not 500: the browser's per-sentence fallback treats any failure
+      // here as "cloud is gone, use the system voice" — which is exactly right.
+      console.error('[jarvis] neural tts failed:', err?.message ?? err)
+      res.writeHead(503, cors)
+      return res.end(String(err?.message ?? 'neural tts failed'))
     }
   }
 
@@ -961,8 +896,105 @@ const handleRequest = async (req, res) => {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // The face. Everything else above is the bridge's own API; anything left
+  // that is a GET (or HEAD) is served as a file from the built frontend, so
+  // the one process can be the whole app: page, assets, websocket, proxies.
+  // ---------------------------------------------------------------------
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    const served = await serveStatic(req, res, cors)
+    if (served) return
+  }
+
   res.writeHead(404, cors)
   res.end()
+}
+
+/**
+ * Where the built frontend lives. `vite build` drops it in dist/ next to the
+ * bridge; JARVIS_DIST overrides for serving from elsewhere.
+ */
+const DIST = process.env.JARVIS_DIST ?? join(homedir(), 'jarvis', 'dist')
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.wasm': 'application/wasm',
+  '.txt': 'text/plain; charset=utf-8',
+  '.map': 'application/json',
+  '.xml': 'application/xml',
+  '.webmanifest': 'application/manifest+json',
+}
+
+/**
+ * Serve one file out of DIST. Returns false when the path is not a file we
+ * can serve, so the caller can fall through to 404. Traversal is refused
+ * before it ever touches the disk, and only whitelisted extensions are
+ * content-typed — anything else would be handed over as a download.
+ */
+async function serveStatic(req, res, cors) {
+  let pathname
+  try {
+    pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname)
+  } catch {
+    return false
+  }
+  if (pathname.includes('\0')) return false
+
+  const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
+  if (!rel || rel.includes('..')) return false
+
+  let file = resolvePath(DIST, rel)
+  if (!file.startsWith(DIST)) return false
+
+  try {
+    let st = await stat(file)
+    if (st.isDirectory()) {
+      file = join(file, 'index.html')
+      st = await stat(file)
+    }
+    if (!st.isFile()) return false
+
+    const type = MIME_TYPES[extname(file)]
+    if (!type) return false
+
+    // Hashed build assets are immutable; the entry document must always be
+    // revalidated or every deploy shows the previous build's shell.
+    const immutable = pathname.startsWith('/assets/')
+    res.writeHead(200, {
+      ...cors,
+      'content-type': type,
+      'content-length': st.size,
+      'cache-control': immutable
+        ? 'public, max-age=31536000, immutable'
+        : 'no-cache',
+    })
+    if (req.method === 'HEAD') {
+      res.end()
+      return true
+    }
+
+    const data = await readFile(file)
+    res.end(data)
+    return true
+  } catch {
+    return false
+  }
 }
 
 const server = http.createServer((req, res) => {
@@ -988,7 +1020,7 @@ const wss = new WebSocketServer({
       console.warn(`[jarvis] rejected websocket on path ${path}`)
       return done(false, 403, 'Forbidden')
     }
-    if (!originAllowed(origin)) {
+    if (!originAllowed(origin, req.headers.host)) {
       console.warn(
         `[jarvis] rejected websocket from origin ${origin ?? '(none)'}` +
           ' — set JARVIS_ALLOWED_ORIGINS to permit it',
@@ -1004,22 +1036,11 @@ console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
   `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
 )
-console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
+console.log('[jarvis] brain: z-ai-web-dev-sdk · 14 tools')
 console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
 )
-// Asynchronous, so it lands a beat after the rest of the banner. Worth printing
-// at all because an extension that is simply not running is indistinguishable
-// at the tool boundary from one that is broken, and this is the one place the
-// difference can be stated before anybody asks a question that depends on it.
-void chromeAvailable().then((ok) => {
-  console.log(
-    ok
-      ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need JARVIS_ALLOW_WRITES=1)'}`
-      : '[jarvis] browser control unavailable — open Chrome with the Claude extension enabled',
-  )
-})
 
 console.log(
   '[jarvis] accepting local dev origins' +
@@ -1027,47 +1048,8 @@ console.log(
     (ALLOW_NO_ORIGIN ? ' and clients that send no origin' : ''),
 )
 
-/**
- * What to tell the browser when a turn ends badly. Plain sentences, because
- * whatever reaches the client is liable to be spoken.
- */
-const RESULT_FAILURES = {
-  error_during_execution: 'The turn failed part way through.',
-  error_max_turns: 'The turn ran too long and was stopped.',
-  error_max_budget_usd: 'The budget for this turn ran out.',
-  error_max_structured_output_retries: 'The answer could not be assembled.',
-  default: 'The turn ended without an answer.',
-}
-
 wss.on('connection', (socket) => {
   console.log('[jarvis] client connected')
-
-  // Answer the HUD straight away rather than making it wait for the agent's
-  // first turn. Refined later by the real init message.
-  socket.send(
-    JSON.stringify({ type: 'ready', servers: Object.keys(MCP_SERVERS) }),
-  )
-
-  /** Resolves the pending user message into the SDK's input generator. */
-  let deliver = null
-  let closed = false
-  const inbox = []
-
-  async function* userMessages() {
-    while (!closed) {
-      const text =
-        inbox.shift() ??
-        (await new Promise((resolve) => {
-          deliver = resolve
-        }))
-      if (closed || text == null) return
-      yield {
-        type: 'user',
-        message: { role: 'user', content: text },
-        parent_tool_use_id: null,
-      }
-    }
-  }
 
   const send = (msg) => {
     if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg))
@@ -1087,52 +1069,11 @@ wss.on('connection', (socket) => {
   const sendTurn = (msg) => send({ ...msg, ask: answering })
 
   /**
-   * Asking the browser for something and waiting for the answer.
+   * Announcing a tool on the HUD, once, and only when it actually runs.
    *
-   * Every other tool here pushes — a panel, a blade, a retint — and never needs
-   * a reply. The camera is the exception: the hardware is over there and the
-   * model is here, so a frame has to come back. Correlated by id because a turn
-   * can have more than one request in flight, and timed out because a browser
-   * that has been closed mid-question would otherwise hang the turn until the
-   * two-minute idle timer noticed.
-   */
-  const waiting = new Map()
-  let asks = 0
-
-  const ask = (kind, args, timeoutMs = 20_000) =>
-    new Promise((resolve, reject) => {
-      if (socket.readyState !== socket.OPEN) {
-        return reject(new Error('the interface is not connected'))
-      }
-      const id = `q${++asks}`
-      const timer = setTimeout(() => {
-        waiting.delete(id)
-        reject(new Error('the interface did not answer in time'))
-      }, timeoutMs)
-      waiting.set(id, { resolve, timer })
-      send({ type: kind, id, ...args })
-    })
-
-  /**
-   * Announcing a tool on the HUD, once, and only if it actually runs.
-   *
-   * A tool_use block surfaces twice — as a partial stream event and again on
-   * the completed assistant message — so ids are remembered. The harder part
-   * is timing, because a refused tool that lights the badge, plays the sound
-   * and provokes a "working on it" line, for work that never happens, reads as
-   * a bug on camera.
-   *
-   * The SDK's order is: the block starts streaming, then canUseTool is asked,
-   * then the tool runs. So nothing is known at content_block_start. Announcing
-   * from inside canUseTool would know the verdict but miss tools entirely —
-   * measured on this SDK, the callback is consulted only for calls the CLI
-   * hasn't already settled, so a `Bash: echo` its own classifier waves through
-   * never reaches us at all.
-   *
-   * So: announce immediately for anything decideTool permits, since those run.
-   * Hold the rest, and let the tool_result settle it — a refusal comes back as
-   * is_error, anything else really did execute and has earned its badge, a
-   * beat late. Nothing is ever announced for work that didn't happen.
+   * The brain announces a call just before executing it and settles it when
+   * the result lands, so the badge never lights up for work that never
+   * happened.
    */
   const seenTools = new Set()
   const heldTools = new Map()
@@ -1140,14 +1081,14 @@ wss.on('connection', (socket) => {
   /**
    * Resolves when the turn in flight has actually finished.
    *
-   * Waiting on session.interrupt() alone is not enough. It resolves when the
-   * agent has been *told* to stop, not when it has, so the last tokens of the
+   * Waiting on the interrupt call alone is not enough. It resolves when the
+   * brain has been *told* to stop, not when it has, so the last tokens of the
    * abandoned answer are still on their way — and since nothing on the wire
    * identifies which question a delta belongs to, they land on the next turn's
    * listener. Measured: ask for ALPHA, interrupt, ask for BRAVO, and BRAVO's
    * answer arrives as "ALPHA\nBRAVO".
    *
-   * The SDK emits exactly one `result` per turn, so that is the boundary worth
+   * The brain emits exactly one terminal event per turn, so that is the boundary worth
    * waiting for. Raced against a timeout because a turn that never reports one
    * must not wedge the conversation for ever — a stray word is a blemish, a
    * deadlocked assistant is not.
@@ -1172,15 +1113,15 @@ wss.on('connection', (socket) => {
     if (!name || (id && seenTools.has(id))) return
     if (id) seenTools.add(id)
     // The display tool isn't work being done, it's the HUD drawing itself —
-    // announcing it would put "jarvis · display" in the tool badge and trigger
-    // a "working on it" filler for something already on screen.
-    if (name === 'mcp__jarvis__display') return
+    // announcing it would put "display" in the tool badge and trigger a
+    // "working on it" filler for something already on screen.
+    if (name === 'display') return
     // The ui_* tools are the same case one step further: retinting the
-    // interface is the interface talking about itself, not work being done for
-    // the user, and the badge would be describing the very thing they can see.
-    if (name.startsWith('mcp__jarvis_ui__')) return
-    if (decideTool(name)) return sendTurn({ type: 'tool', name })
-    if (id) heldTools.set(id, name)
+    // interface is the interface talking about itself, not work being done
+    // for the user, and the badge would be describing the very thing they
+    // can see.
+    if (name.startsWith('ui_')) return
+    sendTurn({ type: 'tool', name })
   }
 
   const settleTool = (id, failed) => {
@@ -1190,210 +1131,33 @@ wss.on('connection', (socket) => {
     if (!failed) sendTurn({ type: 'tool', name })
   }
 
-  const session = query({
-    prompt: userMessages(),
-    options: {
-      // Everything Claude Code has configured, plus the HUD as an in-process
-      // server. The HUD's handler closes over this socket, so a `display` call
-      // lands on screen directly — which is also why this object is built per
-      // connection rather than once.
-      mcpServers: {
-        ...MCP_SERVERS,
-        jarvis: displayServer(
-          (panel) => send({ type: 'panel', panel }),
-          (blade) => send({ type: 'blade', blade }),
-        ),
-        // The interface controls, on the same socket. A separate key because
-        // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
-        // one server; the underscore in it is why decideTool and announceTool
-        // both name `jarvis_ui` explicitly.
-        jarvis_ui: uiServer((op, args) => send({ type: 'ui', op, args })),
-        // The user's own Chrome, over the extension's native-host socket. It
-        // holds no per-connection state, but it is built here with the rest so
-        // the write gate is read once, at the same point as everything else.
-        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
-        // The camera, which unlike everything else here has to ask and wait.
-        jarvis_eyes: visionServer(ask),
-      },
-      // A plain system prompt, not the claude_code preset. The preset is
-      // tuned for a coding agent — verbose, file-oriented, and a large chunk
-      // of input tokens on every turn. Replacing it makes the persona stick,
-      // keeps answers short enough to speak, and cuts cost per turn.
-      systemPrompt: SYSTEM_PROMPT,
-      // Run from the home directory so project-scoped MCP servers don't shadow
-      // the global ones, and so file tools have a sane root.
-      cwd: homedir(),
-      // No filesystem settings at all. Left to its default the SDK loads
-      // ~/.claude/settings.json and settings.local.json exactly as the CLI
-      // does — which on a working machine means a bypassPermissions default
-      // and a pile of allow-rules for Bash. Allow-rules are matched before the
-      // permission callback, so decideTool below would never even be asked
-      // about the tools it most needs to refuse. Empty makes this bridge the
-      // only authority. It also stops the global CLAUDE.md riding along on
-      // every voice turn, carrying instructions written for a coding agent
-      // into a conversation that is meant to be two sentences long.
-      //
-      // The cost is that MCP servers stop being discovered too, which is why
-      // mcpServers above passes them in by hand.
-      settingSources: [],
-      // Stated explicitly, and it has to be.
-      //
-      // With no `model` here the SDK falls back to its own default, which on
-      // this machine resolved to claude-opus-4-8[1m] — not what src/config.ts
-      // declares for the browser-direct path, and not anything anyone chose.
-      // Normally your own `/model` preference would decide, but that lives in
-      // the settings files `settingSources: []` deliberately stops loading, so
-      // without this line nothing in the project has a say at all.
-      model: MODEL,
-      effort: EFFORT,
-      maxTurns: 24,
-      permissionMode: 'default',
-      // Without this the SDK only emits whole assistant messages, and JARVIS
-      // would sit silent until the entire answer was written. Partial events
-      // are what let speech start on the first finished sentence.
-      includePartialMessages: true,
-      // Signature is (toolName, input, options) and it must return a
-      // PermissionResult object. Returning a bare boolean silently denies
-      // everything, with the tool name arriving undefined.
-      //
-      // Worth knowing: this is a last gate, not the only one. Calls the CLI
-      // has already settled never arrive here — its own classifier waves
-      // through a `Bash: echo hello` without asking, and only reaches us for
-      // something with a consequence, like a `touch`. So a deny here is
-      // reliable; an absence of a call here is not proof nothing ran.
-      canUseTool: async (toolName) => {
-        const ok = decideTool(toolName)
-        console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
-        return ok
-          ? { behavior: 'allow' }
-          : {
-              behavior: 'deny',
-              // Every word of this can end up spoken, so it carries no command
-              // to read out — the persona is forbidden from saying one aloud.
-              message:
-                'Blocked: JARVIS is running in read-only mode and cannot take' +
-                ' actions that change anything. Tell the user this action is' +
-                ' unavailable until they enable write access on the machine.',
-            }
-      },
+  /**
+   * The brain. One per connection, exactly like the agent it replaces: it
+   * owns the conversation with the model, streams spoken text back a delta
+   * at a time, and pushes blades and ui ops down this same socket as the
+   * tools fire. Turn boundaries — including when a barge-in has actually
+   * stopped the turn — come back through finishTurn.
+   */
+  const brain = createBrain({
+    send,
+    sendTurn,
+    // A turn is starting for client question `id`; every frame it emits
+    // until it finishes is tagged with that id, so the tail of an
+    // abandoned answer can be ignored by whoever is listening now.
+    begin: (id) => {
+      answering = id
+    },
+    announce: announceTool,
+    settle: settleTool,
+    finishTurn: () => {
+      finishTurn?.()
+      finishTurn = null
+      // One turn's tool ids are never referred to again, and these
+      // otherwise grow for as long as the socket is open.
+      seenTools.clear()
+      heldTools.clear()
     },
   })
-
-  // Pump the session's output stream to the browser for as long as it lives.
-  ;(async () => {
-    try {
-      for await (const msg of session) {
-        if (process.env.JARVIS_DEBUG === '1') {
-          console.log('[msg]', msg.type, msg.event?.type ?? '')
-        }
-
-        switch (msg.type) {
-          // Raw Anthropic stream events, surfaced by includePartialMessages.
-          // This is the ONLY place spoken text arrives: there is no top-level
-          // text_delta message in the SDK union and the 'assistant' message
-          // carries no deltas either. Turn includePartialMessages off and
-          // JARVIS goes completely mute.
-          case 'stream_event': {
-            const ev = msg.event
-            if (
-              ev?.type === 'content_block_delta' &&
-              ev.delta?.type === 'text_delta' &&
-              ev.delta.text
-            ) {
-              sendTurn({ type: 'text', delta: ev.delta.text })
-            }
-            if (
-              ev?.type === 'content_block_start' &&
-              ev.content_block?.type === 'tool_use'
-            ) {
-              announceTool(ev.content_block.id, ev.content_block.name)
-            }
-            break
-          }
-
-          case 'assistant': {
-            // Fallback for builds that emit whole assistant messages rather
-            // than partial events. Deduped against the stream_event path.
-            for (const block of msg.content ?? msg.message?.content ?? []) {
-              if (block.type === 'tool_use') {
-                announceTool(block.id, block.name)
-              }
-            }
-            break
-          }
-
-          case 'user': {
-            // Tool results come back as a user message. This is the only place
-            // a held announcement can be resolved: a refused tool arrives with
-            // is_error set and stays off the HUD, anything else ran.
-            const blocks = msg.message?.content
-            if (!Array.isArray(blocks)) break
-            for (const block of blocks) {
-              if (block?.type === 'tool_result') {
-                settleTool(block.tool_use_id, block.is_error === true)
-              }
-            }
-            break
-          }
-
-          case 'result':
-            // A result is not automatically a success. The error subtypes
-            // carry no `result` field at all, so reporting them as 'done' with
-            // empty text is indistinguishable from a turn that simply had
-            // nothing to say — the HUD stops spinning and JARVIS stands there
-            // silent. Say what happened instead.
-            if (msg.subtype === 'success') {
-              sendTurn({
-                type: 'done',
-                text: msg.result ?? '',
-                costUsd: msg.total_cost_usd ?? null,
-              })
-            } else {
-              console.error(
-                `[jarvis] turn failed: ${msg.subtype}`,
-                msg.errors ?? '',
-              )
-              sendTurn({
-                type: 'error',
-                message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
-              })
-            }
-            // Whatever was waiting on this turn to finish can go now. This is
-            // the only place a turn is genuinely over.
-            finishTurn?.()
-            finishTurn = null
-            // One turn's tool ids are never referred to again, and these
-            // otherwise grow for as long as the socket is open.
-            seenTools.clear()
-            heldTools.clear()
-            break
-
-          case 'system':
-            if (msg.subtype === 'init') {
-              // Servers report 'pending' until first use — they connect
-              // lazily — so only drop the ones that are actually unusable.
-              const usable = (msg.mcp_servers ?? [])
-                .filter((s) => s.status !== 'needs-auth' && s.status !== 'failed')
-                .map((s) => s.name)
-              send({ type: 'ready', servers: usable })
-              console.log(`[jarvis] ${usable.length} MCP servers available`)
-            }
-            break
-        }
-      }
-    } catch (err) {
-      console.error('[jarvis] session error:', err)
-      send({ type: 'error', message: String(err?.message ?? err) })
-      // The stream is finished either way — nothing will ever be read from it
-      // again. Leaving the socket open would leave the client believing it has
-      // a working bridge, and every later question would hang for ever waiting
-      // on a pump that has already stopped. Close it so it reconnects.
-      closed = true
-      deliver?.(null)
-      session.close?.()
-      socket.close()
-    }
-  })()
 
   socket.on('message', (raw) => {
     let msg
@@ -1407,43 +1171,31 @@ wss.on('connection', (socket) => {
       /**
        * Queued behind any interrupt that is still settling.
        *
-       * A barge-in is two messages in quick succession — interrupt, then the
-       * new question — and session.interrupt() is asynchronous. Delivering the
-       * question the instant it arrives means the agent can still be winding
-       * down the previous turn, so its last tokens are emitted after the new
-       * one has begun and land on the new turn's listener. Measured: ask "one",
-       * interrupt, ask "two", and the answer to "two" comes back as "One."
+       * A barge-in is two messages in quick succession — interrupt, then
+       * the new question — and stopping a turn is asynchronous. Handing
+       * the question to the brain before the previous turn has wound down
+       * means its last tokens can be emitted after the new one has begun
+       * and land on the new turn's listener.
        *
-       * Waiting costs nothing when nothing is interrupting — the chain is an
-       * already-resolved promise — and removes the cross-talk when there is.
+       * Waiting costs nothing when nothing is interrupting — the chain is
+       * an already-resolved promise — and removes the cross-talk when
+       * there is.
        */
       const text = msg.text
       const id = typeof msg.id === 'string' ? msg.id : null
+      // The character the browser is currently wearing — the brain swaps its
+      // system prompt when it changes. Anything unknown is ignored and the
+      // brain keeps the persona it already had.
+      const persona = typeof msg.persona === 'string' ? msg.persona : null
       void settling.then(() => {
-        answering = id
-        if (deliver) {
-          const resolve = deliver
-          deliver = null
-          resolve(text)
-        } else {
-          inbox.push(text)
-        }
+        brain.ask(text, id, persona)
       })
-    }
-
-    if (msg.type === 'reply' && typeof msg.id === 'string') {
-      const slot = waiting.get(msg.id)
-      if (slot) {
-        waiting.delete(msg.id)
-        clearTimeout(slot.timer)
-        slot.resolve(msg)
-      }
     }
 
     if (msg.type === 'interrupt') {
       // Held so the next question can wait for it rather than racing it.
       const stopped = turnFinished()
-      settling = Promise.resolve(session.interrupt?.())
+      settling = Promise.resolve(brain.interrupt())
         .catch(() => {})
         .then(() =>
           Promise.race([
@@ -1456,8 +1208,6 @@ wss.on('connection', (socket) => {
 
   socket.on('close', () => {
     console.log('[jarvis] client disconnected')
-    closed = true
-    deliver?.(null)
-    session.close?.()
+    brain.close()
   })
 })

@@ -121,6 +121,450 @@ body::after {
   animation: pulse 1.8s ease-in-out infinite;
 }
 
+/* ------------------------------------------------------ state indicator */
+
+/* The status pill's icon, one per state. The point is that the state is
+   legible at a glance without reading the text: equaliser bars while the
+   machine is hearing you, a spinning arc while it is working, a waveform
+   while it is talking. All inherit the phase's accent colour. */
+.state-ico {
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: center;
+  width: 16px;
+  height: 12px;
+}
+
+.state-ico i {
+  display: block;
+  width: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  border-radius: 1px;
+}
+
+/* The idle states get the plain breathing dot. */
+.state-ico .s-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+.state-ico .s-dot.fast { animation-duration: 0.8s; }
+
+/* Offline: the machine is not even on — hollow, slow. */
+.state-ico .s-dot.hollow {
+  background: transparent;
+  border: 1px solid var(--accent);
+  box-shadow: none;
+  opacity: 0.5;
+  animation: none;
+}
+
+/* Listening / speaking: bars, at two tempos — hearing you is quicker and
+   livelier than talking. */
+.state-ico .s-bar { height: 4px; margin: 0 1px; }
+
+.state-ico.hearing .s-bar { animation: eq 0.9s ease-in-out infinite; }
+.state-ico.hearing .s-bar:nth-child(2) { animation-delay: -0.3s; }
+.state-ico.hearing .s-bar:nth-child(3) { animation-delay: -0.6s; }
+
+.state-ico.talking .s-bar { animation: eq 1.3s ease-in-out infinite; }
+.state-ico.talking .s-bar:nth-child(2) { animation-delay: -0.45s; }
+.state-ico.talking .s-bar:nth-child(3) { animation-delay: -0.9s; }
+
+@keyframes eq {
+  0%, 100% { height: 3px; }
+  50% { height: 12px; }
+}
+
+/* Thinking / booting: the arc. */
+.state-ico .s-arc {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  border-top-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+
+/* Tooling: the arc plus a bar underneath reads as “working on something”
+   rather than just “thinking”. */
+.state-ico .s-tick {
+  width: 12px;
+  height: 3px;
+  border-radius: 1px;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  animation: pulse 0.7s ease-in-out infinite;
+}
+
+/* --------------------------------------------------------------- settings */
+
+/* The gear, top right. Small and quiet on purpose: it is furniture, and the
+   interface's subject is the dial. It only glows when the panel is open or
+   the pointer is on it. */
+.settings {
+  position: absolute;
+  top: 44px;
+  right: 92px;
+  z-index: 8;
+  /* The HUD root passes clicks through to the scene by design; this corner is
+     one of the parts that must not. */
+  pointer-events: auto;
+}
+
+.settings-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 6%, rgba(2, 10, 12, 0.5));
+  color: var(--accent);
+  opacity: 0.55;
+  cursor: pointer;
+  transition: opacity 0.2s ease, border-color 0.2s ease,
+    box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.settings-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.settings-btn:hover,
+.settings-btn.open {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+.settings-btn.open {
+  transform: rotate(45deg);
+}
+
+.settings-panel {
+  position: absolute;
+  top: 40px;
+  right: 0;
+  width: 264px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 7%, rgba(2, 10, 12, 0.88));
+  backdrop-filter: blur(9px);
+  box-shadow: 0 0 40px color-mix(in srgb, var(--accent) 20%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* The panel itself is the last resort scrollbar — the accordion keeps the
+     sections short, and this catches the long voice lists on short screens. */
+  max-height: min(72vh, 560px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--accent) 40%, transparent) transparent;
+}
+
+.settings-panel::-webkit-scrollbar { width: 4px }
+.settings-panel::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 2px;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The fold's header: the title, the current value pressed against the right,
+   and the chevron. The top divider between sections replaces the old gap. */
+.settings-section + .settings-section {
+  border-top: 1px solid color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.settings-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 2px 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s ease;
+}
+
+.settings-section-head:hover { opacity: 1 }
+
+.settings-section-head.on { opacity: 1 }
+
+.settings-section-title {
+  font-size: 8px;
+  letter-spacing: 0.34em;
+  opacity: 0.6;
+  flex: none;
+}
+
+.settings-section-value {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.settings-section-chev {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  opacity: 0.55;
+  transition: transform 0.2s ease;
+}
+
+.settings-section-head.on .settings-section-chev {
+  transform: rotate(180deg);
+}
+
+.settings-section-body {
+  overflow: hidden;
+}
+
+.settings-section-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 0 10px;
+}
+
+/* The one remaining plain title: the system-voices divider inside the
+   VOICE fold. */
+.settings-subtitle {
+  margin-top: 4px;
+}
+
+.settings-title {
+  font-size: 8px;
+  letter-spacing: 0.34em;
+  opacity: 0.5;
+  margin-top: 2px;
+}
+
+.settings-avatars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-avatar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 2px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.settings-avatar:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.settings-avatar.on {
+  border-color: color-mix(in srgb, var(--accent) 75%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.settings-avatar-preview {
+  /* The preview is the avatar's own SVG, colour-inherited so the card reads
+     in the panel's accent exactly like the core reads on the stage. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  color: var(--accent);
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 45%, transparent));
+}
+
+.settings-avatar-preview svg {
+  width: 34px;
+  height: 34px;
+}
+
+.settings-avatar-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-avatar-name {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+}
+
+.settings-avatar-sub {
+  font-size: 9px;
+  opacity: 0.55;
+}
+
+.settings-personas {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-persona {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 2px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.settings-persona:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.settings-persona.on {
+  border-color: color-mix(in srgb, var(--accent) 75%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.settings-persona-mark {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+}
+
+.settings-persona-sub {
+  font-size: 9px;
+  opacity: 0.55;
+}
+
+.settings-persona-wake {
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  opacity: 0.4;
+  text-transform: uppercase;
+}
+
+.settings-voices {
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 4px;
+  /* The HUD has its own thin-scrollbar look; the list borrows it so the panel
+     reads as one surface rather than a browser widget dropped on top. */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--accent) 40%, transparent) transparent;
+}
+
+.settings-voices::-webkit-scrollbar { width: 4px }
+.settings-voices::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 2px;
+}
+
+.settings-voice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 10px;
+  text-align: left;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.settings-voice:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); opacity: 1 }
+
+.settings-voice.on {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  opacity: 1;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.settings-voice-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-voice-lang {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  opacity: 0.45;
+  flex-shrink: 0;
+}
+
+/* Gender badge on the neural voices: ♀ leads the list, so it gets the accent
+   fill; ♂ is the outline form of the same pill. */
+.settings-voice-gender {
+  flex-shrink: 0;
+  font-size: 8px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  color: color-mix(in srgb, var(--accent) 75%, white);
+  opacity: 0.8;
+}
+
+.settings-voice-gender.f {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  opacity: 1;
+}
+
+.settings-empty {
+  font-size: 10px;
+  opacity: 0.45;
+  padding: 4px 2px;
+}
+
+@media (max-width: 700px) {
+  .settings { right: 26px; top: 40px }
+  .settings-panel { width: min(78vw, 264px) }
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.75); }
@@ -797,6 +1241,10 @@ kbd {
 
 /* --------------------------------------------------------------- ignition */
 
+/* The cold open is a loading screen now, not a power button: the name, an
+   indeterminate progress sweep, and the one instruction that matters. The
+   whole plane is still the click target — and the clap listener in App.tsx
+   is still armed — so powering up never takes more than a clap. */
 .ignition {
   position: fixed;
   inset: 0;
@@ -810,27 +1258,66 @@ kbd {
   color: #4fd6ff;
 }
 
-.ignition-ring {
-  position: absolute;
-  width: 240px;
-  height: 240px;
-  border: 1px solid rgba(79, 214, 255, 0.28);
-  border-top-color: rgba(79, 214, 255, 0.9);
-  border-radius: 50%;
-}
-
 .ignition-label {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 12px;
+  gap: 18px;
+  animation: ignitionIn 0.9s ease both;
 }
 
-.ignition-word {
-  font-size: 15px;
+@keyframes ignitionIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.ignition-name {
+  font-size: 13px;
+  font-weight: 600;
   letter-spacing: 0.52em;
   text-indent: 0.52em; /* balance the trailing letter-space */
   text-shadow: 0 0 30px rgba(79, 214, 255, 0.7);
+  transition: text-shadow 0.25s;
+}
+
+.ignition:hover .ignition-name {
+  text-shadow: 0 0 44px rgba(79, 214, 255, 1);
+}
+
+.ignition-bar {
+  width: 200px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(79, 214, 255, 0.14);
+  overflow: hidden;
+}
+
+.ignition-bar-fill {
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: 1px;
+  background: #4fd6ff;
+  box-shadow: 0 0 12px rgba(79, 214, 255, 0.9);
+  animation: ignitionSweep 1.5s ease-in-out infinite;
+}
+
+@keyframes ignitionSweep {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(260%); }
+}
+
+.ignition-word {
+  font-size: 10px;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  opacity: 0.66;
+  animation: ignitionBreathe 2.2s ease-in-out infinite;
+}
+
+@keyframes ignitionBreathe {
+  0%, 100% { opacity: 0.66; }
+  50% { opacity: 0.3; }
 }
 
 .ignition-sub {
@@ -838,10 +1325,6 @@ kbd {
   letter-spacing: 0.28em;
   opacity: 0.4;
   text-transform: uppercase;
-}
-
-.ignition:hover .ignition-word {
-  text-shadow: 0 0 44px rgba(79, 214, 255, 1);
 }
 
 /* ------------------------------------------------------------------- boot */
@@ -1870,20 +2353,14 @@ kbd {
   .hands-live::before { animation: none }
 }
 
-/* Spun in CSS, deliberately. Under framer this was an infinitely repeating
-   animation, and AnimatePresence will not unmount a subtree whose animations
-   never end — which left the whole ignition overlay on top of the interface
-   for the entire session, swallowing every click and every pinch. */
-.ignition-ring { animation: ignitionSpin 18s linear infinite }
-
-@keyframes ignitionSpin {
-  from { transform: rotate(0deg) }
-  to   { transform: rotate(360deg) }
-}
-
-
+/* The ignition's sweep and breathe, under reduced motion: the loading bar
+   holds a calm mid-state instead of animating. The overlay itself is a plain
+   conditional — never wrapped in AnimatePresence, for the reasons recorded at
+   .ignition — so there is no exit animation to worry about here. */
 @media (prefers-reduced-motion: reduce) {
-  .ignition-ring { animation: none }
+  .ignition-label { animation: none }
+  .ignition-bar-fill { animation: none; transform: translateX(75%) }
+  .ignition-word { animation: none; opacity: 0.5 }
 }
 
 /* The live camera inside a blade. Mirrored, because a person expects their own
@@ -1895,4 +2372,70 @@ kbd {
   object-fit: cover;
   transform: scaleX(-1);
   background: #000;
+}
+
+/* ------------------------------------------------------------ command line */
+
+/**
+ * The typed road in, for everywhere a microphone refuses to go. Sits under the
+ * suggestions, above the safe-area edge. Plain CSS only — a framer-motion
+ * transform on a translateX(-50%)-centred element clobbers the centering.
+ */
+.commandline {
+  position: fixed;
+  left: 50%;
+  bottom: max(22px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  width: clamp(280px, 72vw, 620px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  z-index: 6;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, rgba(2, 10, 12, 0.72));
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  box-shadow: 0 0 30px color-mix(in srgb, var(--accent) 16%, transparent);
+  backdrop-filter: blur(6px);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.commandline:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  box-shadow: 0 0 42px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.commandline-prompt {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  opacity: 0.55;
+  user-select: none;
+}
+
+.commandline-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  caret-color: var(--accent);
+}
+
+.commandline-input::placeholder {
+  color: color-mix(in srgb, var(--accent) 45%, transparent);
+  opacity: 0.7;
+}
+
+.commandline-hint {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  opacity: 0.35;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 3px;
+  padding: 1px 6px;
+  user-select: none;
 }

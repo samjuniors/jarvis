@@ -1,9 +1,9 @@
 /**
  * Filler speech.
  *
- * A tool call can take ten seconds, and silence that long reads as a crash. So
- * JARVIS says something the instant work starts — then goes quiet until he has
- * an answer. One acknowledgement, no progress chatter.
+ * A tool call can take ten seconds, and silence that long reads as a crash.
+ * So the assistant says something the instant work starts — then goes quiet
+ * until there is an answer. One acknowledgement, no progress chatter.
  *
  * The phrasing follows the character's actual grammar rather than generic
  * assistant-speak, which matters more than it sounds:
@@ -11,42 +11,17 @@
  *   - Working lines are subjectless present participles: "Compiling.",
  *     "Cross-referencing." Not "I'm now checking" and never "let me".
  *   - There is no snap-to compliance formula. "Right away" and "At once" are
- *     not in his vocabulary; acknowledgement is deferential, not eager.
+ *     not in the vocabulary; acknowledgement is deferential, not eager.
  *   - No filler words, no enthusiasm, no apology, no exclamation marks.
  *   - "Sir" fronted means urgency; final means routine. These are all routine,
  *     so it goes at the end, and only sometimes.
+ *
+ * The pools themselves live in personas.ts — one set per character, swapped
+ * by setFillerPersona when the persona changes — so the voice that answers
+ * to "hey sofia" is also the voice that says "On it."
  */
 
-/** Said as soon as the first tool fires, before any answer exists. */
-const WORKING = [
-  'Working on it, sir.',
-  'Compiling.',
-  'Retrieving.',
-  'Accessing the archive.',
-  'Cross-referencing.',
-  'Running the query now.',
-  'Searching.',
-  'Under way.',
-]
-
-/** Acknowledging an order where no tool is involved. */
-const ACKNOWLEDGE = [
-  'As you wish, sir.',
-  'Very good, sir.',
-  'Certainly.',
-  'Understood.',
-  'Consider it done.',
-  'Directly, sir.',
-]
-
-/** Answering to his name, before the user has said what they want. */
-const ATTENTION = [
-  'Yes, sir?',
-  'Sir?',
-  'At your service, sir.',
-  'Standing by.',
-  'Awake, sir.',
-]
+import { personaById, savedPersona, type Persona } from './personas'
 
 /**
  * Avoids repeating the same phrase twice running, which is what makes canned
@@ -63,9 +38,22 @@ function makePicker(pool: string[]) {
   }
 }
 
-export const working = makePicker(WORKING)
-export const acknowledge = makePicker(ACKNOWLEDGE)
-export const attention = makePicker(ATTENTION)
+const poolsFor = (p: Persona) => ({
+  working: makePicker(p.fillers.working),
+  acknowledge: makePicker(p.fillers.acknowledge),
+  attention: makePicker(p.fillers.attention),
+})
+
+let pools = poolsFor(personaById(savedPersona()))
+
+/** Swap the line pools — call whenever the persona changes. */
+export function setFillerPersona(personaId: string): void {
+  pools = poolsFor(personaById(personaId))
+}
+
+export const working = () => pools.working()
+export const acknowledge = () => pools.acknowledge()
+export const attention = () => pools.attention()
 
 /**
  * Naming the task is warmer than a generic acknowledgement and shows the

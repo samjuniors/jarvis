@@ -61,7 +61,18 @@ export async function unlockAudio(): Promise<void> {
   const c = audio()
   if (c.state === 'suspended') {
     try {
-      await c.resume()
+      /**
+       * Raced, not just caught. A rejected resume() is already handled below —
+       * but one that never settles at all (no gesture in some embedders, an
+       * audio device refusing to appear) would hang ignite() mid-power-up with
+       * the boot guard latched: a dead ignition button recoverable only by
+       * reloading. Losing the wait after three seconds costs at most a silent
+       * start; keeping it can cost the whole assistant.
+       */
+      await Promise.race([
+        c.resume(),
+        new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+      ])
     } catch {
       /**
        * Swallowed on purpose, now that a clap can start the assistant.

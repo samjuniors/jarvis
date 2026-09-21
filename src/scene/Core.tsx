@@ -1,23 +1,31 @@
-import { useRef, useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import type { Drive } from './Scene'
+import { useStore } from '../store'
+import { personaById } from '../lib/personas'
 
 /**
  * The reactor.
  *
- * Modelled on the JARVIS: A Second Screen Experience interface rather than on
- * the suit HUD, because that is the thing this app actually is — an assistant
- * you talk to, sitting idle and listening, not a targeting display. That
- * interface is one big COMPLETE ring: a soft teal torus with a dusty, eroded
- * outer edge and a finely textured disc inside it, on near-black. There is no
- * compass, there are no gauges, and nothing is a broken arc.
+ * Modelled on the classic Iron Man JARVIS dial: a stack of concentric
+ * instrument rings rather than one soft torus — an outer ring with a gap at
+ * six o'clock and a doubled arc at twelve, a dotted data track, a measurement
+ * ring with a ruler of ticks and strings of zeros riding it, segmented arcs
+ * with a bar graph bracketing the left, and one unbroken core ring that is
+ * the brightest thing on the screen. The word J.A.R.V.I.S sits inside it in
+ * etched steel rather than neon, exactly as projected light would read.
  *
- * It is drawn as a single camera-facing plane with a polar fragment shader
- * rather than as geometry. Everything here is a function of radius and angle,
- * which is exactly what a shader is good at, and it means the eroded edge is
- * real per-pixel turbulence instead of a displaced mesh pretending to be a
- * ring — which is how the old build ended up with a lumpy sphere.
+ * It is drawn as a single camera-facing plane with a polar fragment shader,
+ * as before: everything here is a function of radius and angle, and the
+ * rings are crisp analytic strokes, not displaced geometry. The one thing a
+ * shader cannot do is glyphs — the zero strings and the centre word are
+ * rasterised once into a canvas texture (real webfonts, real letterforms)
+ * and sampled twice: once straight, for the word and the tiny upper zeros,
+ * and once rotated, for the long zero bands that drift along their track.
+ *
+ * The particles that used to halo this are gone by request — the dial is the
+ * whole subject now, and its atmosphere is the bloom on the lines themselves.
  */
 
 const vertex = /* glsl */ `
@@ -29,10 +37,12 @@ const vertex = /* glsl */ `
 `
 
 const fragment = /* glsl */ `
+  uniform sampler2D uGlyphs;
   uniform vec3  uColor;
   uniform vec3  uHot;
   uniform float uLevel;
   uniform float uPhase;
+  uniform float uRing;
   uniform float uOpen;
   uniform float uZoom;
   uniform float uIntensity;
@@ -40,204 +50,336 @@ const fragment = /* glsl */ `
 
   varying vec2 vUv;
 
-  // -- value noise + fbm ----------------------------------------------------
-  vec2 hash(vec2 p) {
-    p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-    return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
-  }
-
-  float noise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    return mix(
-      mix(dot(hash(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0)),
-          dot(hash(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
-      mix(dot(hash(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)),
-          dot(hash(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x),
-      u.y);
-  }
-
-  float fbm(vec2 p) {
-    float v = 0.0;
-    float a = 0.5;
-    for (int i = 0; i < 5; i++) {
-      v += a * noise(p);
-      p *= 2.02;
-      a *= 0.5;
-    }
-    return v;
-  }
+  #define PI 3.14159265359
+  #define TAU 6.28318530718
 
   // A soft complete circle at radius r0, w wide.
   float band(float r, float r0, float w) {
     return exp(-pow((r - r0) / w, 2.0));
   }
 
-  #define TAU 6.28318530718
+  // Signed shortest angular distance from c, wrapped.
+  float adist(float a, float c) {
+    return mod(a - c + PI, TAU) - PI;
+  }
+
+  // An angular window centred on c: 1 inside hw radians, eased over soft.
+  float awin(float a, float c, float hw, float soft) {
+    return 1.0 - smoothstep(hw - soft, hw, abs(adist(a, c)));
+  }
+
+  vec2 rot2(vec2 p, float t) {
+    float c = cos(t), s = sin(t);
+    return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+  }
 
   void main() {
-    // The shader field is scaled up so the ring sits in the middle of the
-    // frame with dark margin around it — the reference disc, not something that
-    // fills the screen edge to edge. Angle is scale-invariant, so the erosion
-    // pattern is untouched.
     vec2 p = (vUv * 2.0 - 1.0) * uZoom;
     float r = length(p);
     float a = atan(p.y, p.x);
-
-    // Sampling the turbulence on the unit circle rather than on p keeps it
-    // continuous across the -pi/pi seam, which a plain atan lookup is not.
-    vec2 ring = vec2(cos(a), sin(a));
-
-    // -- the main ring ------------------------------------------------------
-    // Its radius wanders on two scales, so the outline is never a clean
-    // geometric circle — this dusty, breathing edge is the whole character of
-    // the thing. The slow term drifts; the fine term shivers.
-    float wob   = fbm(ring * 2.6 + vec2(uPhase * 0.22, 0.0)) * 0.055;
-    float grain = fbm(ring * 9.0 - vec2(uPhase * 0.4, 0.0)) * 0.020;
-    float R = 0.74 + wob + grain + uLevel * 0.03;
-
-    // Erosion: the outer boundary is eaten away in patches, so the ring reads
-    // as something luminous and unstable rather than as a drawn stroke.
-    float erode = smoothstep(-0.25, 0.35, fbm(ring * 5.0 + vec2(uPhase * 0.5, 3.0)));
+    float lv = uLevel;
 
     // -- style ---------------------------------------------------------------
-    // Weights on the terms that already exist rather than three shaders or
-    // three meshes. Every k below is exactly 1.0 and the body fill is exactly
-    // 0.0 at uStyle 0, so 'ring' is the authored look untouched, term for term.
-    //
-    // 'sphere' fills the interior and lets the outline go soft, which is the
-    // whole difference between a body and a drawn circle. 'wire' does the
-    // opposite: it keeps only the things that are genuinely lines — the
-    // concentric hairlines and the polar weave — and drops the washes and the
-    // glow that were filling the space between them.
+    // Weights on the terms that already exist, per the old contract: 'ring' is
+    // the authored dial untouched, 'sphere' trades outline for a lit body,
+    // 'wire' keeps the fine instrument lines and drops the washes.
     float wSphere = clamp(1.0 - abs(uStyle - 1.0), 0.0, 1.0);
     float wWire   = clamp(1.0 - abs(uStyle - 2.0), 0.0, 1.0);
 
-    float kOutline = mix(1.0, 0.45, wSphere) * mix(1.0, 0.70, wWire);
-    float kDust    = mix(1.0, 0.30, wSphere) * mix(1.0, 0.80, wWire);
-    float kLines   = mix(1.0, 0.35, wSphere) * mix(1.0, 3.00, wWire);
-    float kMesh    = mix(1.0, 0.60, wSphere) * mix(1.0, 2.60, wWire);
-    float kWash    = mix(1.0, 1.60, wSphere) * mix(1.0, 0.00, wWire);
-    float kGlow    = mix(1.0, 2.20, wSphere) * mix(1.0, 0.30, wWire);
+    float kOutline = mix(1.0, 0.55, wSphere) * mix(1.0, 0.80, wWire);
+    float kDetail  = mix(1.0, 0.60, wSphere) * mix(1.0, 1.70, wWire);
+    float kWash    = mix(1.0, 1.90, wSphere) * mix(1.0, 0.00, wWire);
+    float kGlow    = mix(1.0, 2.10, wSphere) * mix(1.0, 0.35, wWire);
 
-    float outer = band(r, R, 0.030) * (0.45 + erode * 0.6);
-    // A second, tighter pass just inside gives the ring an inner wall, which is
-    // what makes it read as a tube seen slightly from the front.
-    float wall  = band(r, R - 0.055, 0.020) * 0.5;
-    // A fine bright filament riding the outer edge.
-    float edge  = band(r, R + 0.004, 0.007) * (0.5 + uLevel * 0.45);
+    // -- washes ---------------------------------------------------------------
+    // The reference's deep navy gradient, kept faint — the page behind the
+    // canvas is already near-black, so this is atmosphere, not backdrop.
+    float bg    = exp(-r * 1.7) * 0.05;
+    float inner = smoothstep(0.42, 0.08, r) * (0.045 + lv * 0.05);
 
-    // Dust: a scatter of bright motes clinging to the outer edge, densest right
-    // at the rim and thinning outward, so the ring dissolves into grains rather
-    // than ending at a line. This is the single most reference-accurate detail.
-    float speck = fbm(ring * 46.0 + vec2(uPhase * 0.15, 11.0));
-    speck = pow(max(speck, 0.0), 3.0);
-    float dust = speck * band(r, R + 0.028, 0.055) * (1.4 + uLevel);
+    // -- R1: the outer ring (r 0.95) -----------------------------------------
+    // A gap at six o'clock, a doubled bright arc at twelve, dashes sweeping
+    // two-to-four, a cluster of dots at four-to-five, three block ticks at
+    // nine-to-ten. The asymmetry is the "active instrument" read.
+    float gapMask = 1.0 - awin(a, -PI * 0.5, 0.26, 0.05);
+    float topArc  = band(r, 0.95, 0.022) * awin(a, PI * 0.5, 0.52, 0.18);
+    float dashes  = step(0.5, fract(a * 24.0 / TAU))
+                  * awin(a, 0.0, 0.62, 0.10);
+    float dots = 0.0;
+    for (int i = 0; i < 9; i++) {
+      dots += awin(a, -0.52 - float(i) * 0.068, 0.016, 0.009);
+    }
+    float ticks = awin(a, 2.71, 0.038, 0.012)
+                + awin(a, 2.88, 0.038, 0.012)
+                + awin(a, 3.05, 0.038, 0.012);
+    float r1 = band(r, 0.95, 0.013) * gapMask * (0.70 + lv * 0.25)
+             + topArc * (1.00 + lv * 0.45)
+             + band(r, 0.95, 0.013) * dashes * 0.85
+             + band(r, 0.95, 0.009) * dots * 0.90
+             + band(r, 0.95, 0.016) * ticks * 0.90;
 
-    // -- radar sweep --------------------------------------------------------
-    // A soft luminous wedge travelling around the ring, leaving a fading wake
-    // behind it — the one moving element the eye locks onto. Its wake also
-    // rekindles the dust it passes, so the edge glitters in its path.
-    float sweepA = mod(uPhase * 0.55, TAU);
-    float dA = mod(a - sweepA + TAU + 3.14159, TAU) - 3.14159; // signed, wrapped
-    // Both edges eased. A hard step on the leading edge cuts the wake off with
-    // a visible radial seam, which reads as a rendering fault rather than as a
-    // sweep — it was the one artefact in the whole ring.
-    float wake = smoothstep(-2.6, -0.15, dA) * (1.0 - smoothstep(0.0, 0.22, dA));
-    float radar = wake * band(r, R - 0.02, 0.075) * (0.55 + uLevel * 0.45);
+    // -- R2: the dotted data track (r 0.86) -----------------------------------
+    // A hairline perforated into dots, with a brighter arc riding the top
+    // under the tiny zero readout.
+    float dotPat = smoothstep(0.30, 0.70, fract(a * 72.0 / TAU));
+    float r2 = band(r, 0.86, 0.0055) * (0.30 + 0.70 * dotPat) * 0.55
+             + band(r, 0.86, 0.0085) * awin(a, PI * 0.5, 0.55, 0.20) * 0.75;
 
-    // -- concentric hairlines inside ---------------------------------------
-    float lines =
-        band(r, 0.615, 0.0035) * 0.45
-      + band(r, 0.560, 0.0030) * 0.28
-      + band(r, 0.470, 0.0035) * 0.36;
+    // -- R3: the measurement ring (r 0.72) + ruler ----------------------------
+    // A fine circle with a ruler of ticks outside it: one every 12 degrees,
+    // a longer one every 60. The zero bands ride this track (below).
+    float tFine = fract(a * 30.0 / TAU);
+    float tickFine = 1.0 - smoothstep(0.03, 0.12, abs(tFine - 0.5));
+    float tCoarse = fract(a * 6.0 / TAU);
+    float tickCoarse = 1.0 - smoothstep(0.012, 0.06, abs(tCoarse - 0.5));
+    float r3 = band(r, 0.72, 0.0045) * 0.60
+             + band(r, 0.752, 0.014) * tickFine * 0.45
+             + band(r, 0.762, 0.024) * tickCoarse * 0.50;
 
-    // -- the textured core disc --------------------------------------------
-    // Two counter-rotating polar meshes, dense enough to read as a woven
-    // membrane rather than as stripes. The counter-rotation keeps it alive
-    // without ever resolving into a direction the eye can follow.
-    float m1 = (sin(a * 96.0 + uPhase * 0.6) * 0.5 + 0.5)
-             * (sin(r * 210.0) * 0.5 + 0.5);
-    float m2 = (sin(a * 60.0 - uPhase * 0.4) * 0.5 + 0.5)
-             * (sin(r * 150.0 - uPhase) * 0.5 + 0.5);
-    float mesh = mix(m1, m2, 0.5);
-    float core = smoothstep(0.40, 0.36, r);
-    float coreTex = core * (0.04 * kWash + mesh * 0.12 * kMesh) * (0.55 + uLevel * 0.9);
-    // The disc's own soft rim.
-    float coreEdge = band(r, 0.385, 0.010) * (0.55 + uLevel * 0.5);
+    // -- R4: segmented arcs (r 0.58), drifting --------------------------------
+    // Four arcs with the gaps centred on the diagonals, turning slowly. The
+    // bar graph brackets the left side and stays put — an equaliser pinned
+    // to the dial, its bars breathing with the voice.
+    float a4 = a + uRing * 0.7;
+    float seg = awin(a4, PI * 0.25, 0.46, 0.06)
+              + awin(a4, PI * 0.75, 0.46, 0.06)
+              + awin(a4, -PI * 0.75, 0.46, 0.06)
+              + awin(a4, -PI * 0.25, 0.46, 0.06);
+    float r4 = band(r, 0.58, 0.0085) * seg * 0.90;
 
-    // A slow pulse rippling out through the core, the reactor's heartbeat.
-    float pulse = band(r, fract(uPhase * 0.08) * 0.40, 0.020) * core * 0.45;
+    float bars = 0.0;
+    for (int i = 0; i < 7; i++) {
+      float ang = 2.62 + float(i) * 0.175;
+      float amp = 0.5 + 0.5 * sin(float(i) * 2.3 + uPhase * 0.6);
+      float len = 0.028 + 0.055 * amp * (0.35 + lv * 0.95);
+      float rIn = 0.60;
+      float rOut = rIn + len;
+      bars += awin(a, ang, 0.020, 0.010)
+            * smoothstep(rIn - 0.004, rIn + 0.004, r)
+            * (1.0 - smoothstep(rOut - 0.004, rOut + 0.004, r));
+    }
 
-    // -- inner glow ---------------------------------------------------------
-    float bloom = exp(-r * 3.4) * (0.16 + uLevel * 0.34);
+    // -- R5: the core ring (r 0.42) --------------------------------------------
+    // Unbroken and the brightest element in the design — a neon tube. Its
+    // glow is the bloom pass doing the work; this is just the tube.
+    float r5 = band(r, 0.42, 0.0125) * (1.45 + lv * 0.55);
+    float r5glow = exp(-pow((r - 0.42) / 0.075, 2.0)) * 0.40;
 
-    // The one term with no counterpart in the ring: a solid interior out to the
-    // wandering rim, so the sphere is lit all the way across instead of being a
-    // hoop with a textured disc floating in the middle of it.
-    float bodyFill = wSphere * smoothstep(R + 0.02, R - 0.32, r)
-                   * (0.10 + uLevel * 0.10);
+    // -- the sweep --------------------------------------------------------------
+    // A soft luminous wedge travelling the outer band with a fading wake —
+    // the one moving element the eye locks onto, kept from the old core.
+    float sweepA = mod(uPhase * 0.5, TAU);
+    float dA = adist(a, sweepA);
+    float wake = smoothstep(-2.4, -0.12, dA) * (1.0 - smoothstep(0.0, 0.18, dA));
+    float sweep = wake * band(r, 0.95, 0.09) * (0.40 + lv * 0.45);
 
-    float v = (outer + wall + edge + coreEdge) * kOutline
-            + dust * kDust
-            + radar
-            + lines * kLines
-            + coreTex + pulse
-            + bloom * kGlow
-            + bodyFill;
+    // -- glyphs -----------------------------------------------------------------
+    // One texture, sampled twice. The straight sample carries the centre word
+    // and the tiny zeros on R2; the rotated sample carries the long zero bands
+    // on R3, drifting along their track. Rotation preserves radius, so each
+    // use is masked to its own annulus and the word never turns.
+    float gS = texture2D(uGlyphs, p * 0.5 + 0.5).a;
+    float word = gS * (1.0 - smoothstep(0.44, 0.50, r));
+    float tinyZeros = gS * band(r, 0.86, 0.05);
+    vec2 q3 = rot2(p, -uRing * 0.5);
+    float gR = texture2D(uGlyphs, q3 * 0.5 + 0.5).a;
+    float zeros = gR * band(r, 0.72, 0.055);
 
-    // The moving highlights run hot; the body of the ring keeps its hue.
-    vec3 col = mix(uColor, uHot,
-      clamp(edge * 1.3 + radar * 0.7 + pulse * 0.5 + dust * 0.4, 0.0, 1.0));
+    // -- assemble ------------------------------------------------------------------
+    float h = clamp(r5 * 0.75 + sweep * 0.8 + topArc * 0.5, 0.0, 1.0);
+    vec3 ringCol = mix(uColor, uHot, h);
+    // The word is etched steel, not neon — fixed cool grey, tinted only
+    // slightly by whatever the phase has done to the rest of the dial.
+    vec3 wordCol = mix(vec3(0.62, 0.74, 0.84), uColor, 0.30);
 
-    // Radial reveal on power-up: the ring assembles from the centre outward.
+    float v = (r1 + r2 + r3 + r4) * kOutline
+            + (bars + zeros * 0.80 + tinyZeros * 0.65) * kDetail
+            + r5 + sweep
+            + r5glow * kGlow
+            + (bg + inner) * kWash;
+
+    float wordTerm = word * 0.95;
+    v += wordTerm;
+    float wordShare = wordTerm / max(v, 0.0001);
+    vec3 col = mix(ringCol, wordCol, clamp(wordShare, 0.0, 1.0));
+
+    // Radial reveal on power-up: the dial assembles from the centre outward.
     v *= smoothstep(0.0, 0.35, uOpen - r * 0.45);
 
-    // Brightness authority for the whole orb, applied last so it scales the
-    // finished image rather than any one term. 1.0 is the authored look.
+    // Brightness authority for the whole dial, applied last. 1.0 is authored.
     v *= uIntensity;
 
     gl_FragColor = vec4(col * v, v);
   }
 `
 
+/**
+ * The zero bands and the centre word, rasterised onto a canvas the shader
+ * samples.
+ *
+ * A shader cannot draw letterforms, so the glyphs live in a 2048-square
+ * canvas whose centre is the origin and whose half-width is one field unit —
+ * the same coordinate frame the shader addresses, so the mapping is p * 0.5
+ * + 0.5 and nothing else. Text on the top arc is upright and reads
+ * left-to-right; text on the bottom arc keeps its tops toward the centre,
+ * which is how the reference draws it.
+ *
+ * Only the alpha channel is consumed; the glyphs are drawn white and tinted
+ * in the shader by the phase colour like every other line.
+ *
+ * Drawn synchronously with whatever fonts are available the moment the dial
+ * mounts, then redrawn once document.fonts.ready says the real webfonts are
+ * in — an empty dial while a font request hung in the void is worse than a
+ * beat of fallback letterforms, and needsUpdate on the same canvas swaps
+ * them without touching the binding. The same redraw path serves a persona
+ * switch: the word at the centre of the dial is the character's name.
+ */
+const GLYPH_SIZE = 2048
+
+function drawGlyphs(canvas: HTMLCanvasElement, word: string) {
+  const U = GLYPH_SIZE / 2 // one field unit, in canvas pixels
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  ctx.clearRect(0, 0, GLYPH_SIZE, GLYPH_SIZE)
+  ctx.translate(U, U)
+  ctx.fillStyle = '#ffffff'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+
+  const arcText = (
+    text: string,
+    radius: number,
+    from: number,
+    to: number,
+    font: string,
+    alpha: number,
+    side: 'top' | 'bottom',
+  ) => {
+    ctx.save()
+    ctx.font = font
+    ctx.globalAlpha = alpha
+    const n = text.length
+    for (let i = 0; i < n; i++) {
+      const t = from + ((i + 0.5) / n) * (to - from)
+      ctx.save()
+      ctx.rotate(t)
+      ctx.translate(0, side === 'top' ? -radius : radius)
+      ctx.fillText(text[i], 0, 0)
+      ctx.restore()
+    }
+    ctx.restore()
+  }
+
+  const mono = (px: number) => `300 ${px}px "JetBrains Mono", monospace`
+
+  // The long band on the measurement ring: upper string bright, lower one
+  // smaller and dimmer, as the reference draws them.
+  arcText('0'.repeat(34), 0.715 * U, -1.42, 1.42, mono(36), 0.95, 'top')
+  arcText('0'.repeat(24), 0.715 * U, 1.15, -1.15, mono(27), 0.55, 'bottom')
+  // The tiny readout riding the data track's brighter top arc.
+  arcText('0'.repeat(14), 0.86 * U, -0.55, 0.55, mono(22), 0.8, 'top')
+
+  // The centre word, placed letter by letter so the tracking is real
+  // everywhere: ctx.letterSpacing is not yet universal.
+  const px = 0.125 * U
+  const track = 0.018 * U
+  ctx.font = `600 ${px}px "Chakra Petch", sans-serif`
+  const widths = [...word].map((ch) => ctx.measureText(ch).width)
+  const total =
+    widths.reduce((s, w) => s + w, 0) + track * (word.length - 1)
+  let x = -total / 2
+  for (let i = 0; i < word.length; i++) {
+    ctx.fillText(word[i], x + widths[i] / 2, 0)
+    x += widths[i] + track
+  }
+}
+
 /** The plane's half-width in world units. */
 const HALF = 2.7
-/** Radius, in the shader's own field units, at which the ring is drawn. */
-const RING_R = 0.74
+/** Radius, in the shader's own field units, of the outermost ring. */
+const RING_R = 0.95
 /**
- * Ring diameter as a fraction of the SHORTER viewport dimension.
+ * Outer ring diameter as a fraction of the SHORTER viewport dimension.
  *
  * Framing has to be driven by the viewport rather than by a constant, because
  * the plane is a fixed size in world units while the frame is not: the same
- * scale that leaves a comfortable margin on a 16:9 monitor runs the ring off
+ * scale that leaves a comfortable margin on a 16:9 monitor runs the dial off
  * both edges of a portrait window.
  */
-const FIT = 0.60
+const FIT = 0.7
 
 export function Core({ drive }: { drive: Drive }) {
   const mat = useRef<THREE.ShaderMaterial>(null)
   const mesh = useRef<THREE.Mesh>(null)
   const viewport = useThree((s) => s.viewport)
+  const persona = useStore((s) => s.persona)
+  const word = personaById(persona).dialWord
+
+  /**
+   * The glyph sheet, drawn before the first frame and kept for the life of
+   * the dial. The canvas is redrawn in place when the webfonts land or the
+   * persona changes, so the binding never changes — only the pixels under
+   * it do.
+   */
+  const glyphs = useMemo(() => {
+    const canvas = document.createElement('canvas')
+    canvas.width = canvas.height = GLYPH_SIZE
+    // The persona's word, as of mount; later switches redraw through the
+    // effect below rather than rebuilding the texture.
+    drawGlyphs(canvas, word)
+    const texture = new THREE.CanvasTexture(canvas)
+    texture.anisotropy = 4
+    return { canvas, texture }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [word])
+
+  useEffect(() => {
+    drawGlyphs(glyphs.canvas, word)
+    glyphs.texture.needsUpdate = true
+  }, [glyphs, word])
+
+  useEffect(() => {
+    let alive = true
+    // Whatever fonts are ready now already drew it; swap in the real
+    // letterforms once the document's fonts have settled. fonts.ready always
+    // settles — unlike fonts.load for a named face, which can hang off a
+    // stylesheet that is still fetching.
+    document.fonts?.ready.then(() => {
+      if (!alive) return
+      drawGlyphs(
+        glyphs.canvas,
+        personaById(useStore.getState().persona).dialWord,
+      )
+      glyphs.texture.needsUpdate = true
+    })
+    return () => {
+      alive = false
+    }
+  }, [glyphs])
+
+  useEffect(() => () => glyphs.texture.dispose(), [glyphs])
 
   const uniforms = useMemo(
     () => ({
+      uGlyphs: { value: glyphs.texture },
       uColor: { value: new THREE.Color('#19c4c4') },
       // Not white — a tinted highlight keeps the hue readable once bloom
-      // stacks on top, instead of washing the ring out to a grey band.
-      uHot: { value: new THREE.Color('#c9fdff') },
+      // stacks on top, instead of washing the core ring out to a grey band.
+      uHot: { value: new THREE.Color('#b9fdff') },
       uLevel: { value: 0 },
       uPhase: { value: 0 },
+      // Accumulated ring rotation, so rate changes never teleport a layer.
+      uRing: { value: 0 },
       uOpen: { value: 0 },
       // Field scale, recomputed every frame from the viewport — see below.
       uZoom: { value: 1.2 },
-      // Both of these are deliberately identities at their defaults: the ring
+      // Both of these are deliberately identities at their defaults: the dial
       // renders byte for byte as it did before they existed.
       uIntensity: { value: 1 },
       uStyle: { value: 0 },
     }),
-    [],
+    [glyphs],
   )
 
   useFrame((_, dt) => {
@@ -246,9 +388,9 @@ export function Core({ drive }: { drive: Drive }) {
     const r = drive.reactor
 
     mesh.current.visible = r.visible
-    // Scaling the mesh rather than the shader's field. The ring sits at a fixed
-    // radius inside a fixed quad with dark margin around it, so zooming the
-    // field out would push the ring past the quad's own edge and cut it off in
+    // Scaling the mesh rather than the shader's field. The rings sit at fixed
+    // radii inside a fixed quad with dark margin around them, so zooming the
+    // field out would push the dial past the quad's own edge and cut it off in
     // a square; moving the quad takes the margin along with it.
     mesh.current.scale.setScalar(r.scale)
 
@@ -256,10 +398,15 @@ export function Core({ drive }: { drive: Drive }) {
     u.uZoom.value = (RING_R * HALF) / (FIT * 0.5 * fit)
     u.uLevel.value += (drive.level - u.uLevel.value) * Math.min(1, dt * 8)
     // Accumulated, not derived from elapsed time scaled by level — scaling the
-    // clock would rewrite all the turbulence that has already happened, and the
-    // edge would boil harder the longer the tab had been open. The spin
-    // multiplier rides on the same accumulator for the same reason.
+    // clock would rewrite all the drift that has already happened, and the
+    // layers would visibly jump whenever the rate changed. The same rule
+    // keeps uRing and the reactor spin multiplier on accumulators.
     u.uPhase.value += dt * (0.5 + u.uLevel.value * 0.7) * r.spin
+    // The dial's layers drift at their own fixed shares of one accumulator,
+    // whose rate rides the phase's spin table: the rings turn harder while
+    // JARVIS works, and the drift never snaps when the phase changes.
+    u.uRing.value +=
+      dt * (0.10 + drive.spin * 0.085 + u.uLevel.value * 0.30)
     u.uOpen.value += (drive.open - u.uOpen.value) * Math.min(1, dt * 1.6)
     u.uIntensity.value = r.intensity
     u.uStyle.value = r.style
@@ -268,7 +415,7 @@ export function Core({ drive }: { drive: Drive }) {
 
   return (
     <mesh ref={mesh} frustumCulled={false}>
-      {/* One quad. The ring lives entirely in the fragment shader, so there is
+      {/* One quad. The dial lives entirely in the fragment shader, so there is
           no geometry to tessellate and nothing to displace. */}
       <planeGeometry args={[5.4, 5.4]} />
       <shaderMaterial

@@ -23,14 +23,16 @@ export type { ConnectionState } from './bridge'
 export const usingBridge = BACKEND === 'bridge'
 
 /** Conversation state lives in the bridge session, so history is only threaded
- *  through on the direct path. */
+ *  through on the direct path. The persona rides every ask so the brain can
+ *  swap its system prompt when the character changes mid-session. */
 export async function ask(
   prompt: string,
   history: Msg[],
   handlers: AskHandlers,
+  persona?: string,
 ): Promise<{ text: string; tools: string[] }> {
   return usingBridge
-    ? bridge.ask(prompt, handlers)
+    ? bridge.ask(prompt, handlers, persona)
     : direct.ask([...history, { role: 'user', content: prompt }], handlers)
 }
 

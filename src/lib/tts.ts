@@ -7,7 +7,7 @@ import {
   BRIDGE_HTTP_URL,
 } from '../config'
 import * as kokoro from './kokoro'
-import { caps } from './capabilities'
+import { caps, type NeuralVoice } from './capabilities'
 
 /**
  * Speech output.
@@ -62,7 +62,7 @@ const ECHO_TAIL_MS = 1800
  * indistinguishable. This tells them apart at a glance.
  */
 export const diag = {
-  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs',
+  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs' | 'neural',
   /** Utterances handed to an engine — the OS voice or an audio element. */
   spoken: 0,
   /**
@@ -159,6 +159,57 @@ const ABBREVIATION =
 const MAX_UNSPOKEN = 220
 
 // ---------------------------------------------------------------------------
+// Neural voice selection
+// ---------------------------------------------------------------------------
+
+const CLOUD_VOICE_KEY = 'jarvis.cloudVoice'
+
+/** The neural catalogue, female-first. The bridge reports the full list with
+ *  measured genders; before the probe lands (or without a bridge) a known
+ *  default stands in so a saved preference still has something to resolve
+ *  against. */
+export function neuralVoices(): NeuralVoice[] {
+  const list = caps().voices
+  const ordered = list.length
+    ? [...list]
+    : ([
+        {
+          id: 'tongtong',
+          label: 'Tongtong',
+          gender: 'female',
+          vibe: 'warm · friendly',
+        },
+      ] as NeuralVoice[])
+  // Female voices lead the picker — the assistant's default character is a
+  // woman — but the rest keep the bridge's own ordering.
+  return ordered.sort((a, b) =>
+    a.gender === b.gender ? 0 : a.gender === 'female' ? -1 : 1,
+  )
+}
+
+/** The id to send /tts. A saved choice that the bridge no longer offers falls
+ *  back to the first female voice rather than being sent and silently ignored. */
+export function cloudVoiceId(): string {
+  const saved = localStorage.getItem(CLOUD_VOICE_KEY)
+  const list = neuralVoices()
+  if (saved && list.some((v) => v.id === saved)) return saved
+  return list[0]?.id ?? 'tongtong'
+}
+
+/** The picker's write path — the settings panel and the V key both land here. */
+export function setCloudVoice(id: string): boolean {
+  if (!neuralVoices().some((v) => v.id === id)) return false
+  localStorage.setItem(CLOUD_VOICE_KEY, id)
+  return true
+}
+
+/** True when speech goes through the bridge's cloud-quality engine — ElevenLabs
+ *  with a key, the z-ai neural engine without one. */
+function cloudActive(): boolean {
+  return USE_ELEVENLABS || caps().tts
+}
+
+// ---------------------------------------------------------------------------
 // Voice selection
 // ---------------------------------------------------------------------------
 
@@ -244,7 +295,11 @@ function pickVoice(): SpeechSynthesisVoice | null {
  *  always naming a speechSynthesis voice that a cloud or neural engine has
  *  quietly replaced. */
 export function currentVoiceName(): string {
-  if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
+  if (cloudActive()) {
+    if (caps().engine === 'elevenlabs') return 'ElevenLabs'
+    const v = neuralVoices().find((x) => x.id === cloudVoiceId())
+    return v?.label ?? 'neural'
+  }
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
     return KOKORO_VOICE.replace(/^bm_/, '')
   }
@@ -252,8 +307,18 @@ export function currentVoiceName(): string {
 }
 
 /** Step to the next candidate — lets you audition voices on your own machine
- *  rather than trusting a ranking to be right about how they sound. */
+ *  rather than trusting a ranking to be right about how they sound. With the
+ *  neural engine live this walks the bridge's catalogue, not the machine's
+ *  speechSynthesis inventory. */
 export function cycleVoice(): string {
+  if (cloudActive()) {
+    if (caps().engine === 'elevenlabs') return 'ElevenLabs'
+    const list = neuralVoices()
+    const now = list.findIndex((v) => v.id === cloudVoiceId())
+    const next = list[(now + 1) % list.length]
+    localStorage.setItem(CLOUD_VOICE_KEY, next.id)
+    return next.label
+  }
   const list = candidateVoices()
   if (!list.length) return 'default'
   const now = pickVoice()
@@ -262,6 +327,38 @@ export function cycleVoice(): string {
   localStorage.setItem(VOICE_PREF_KEY, next.name)
   cachedVoice = next
   return next.name
+}
+
+/**
+ * Every English voice on the machine, best-first — the settings picker's list.
+ *
+ * Broader than candidateVoices() on purpose: the candidates are ranked for
+ * one character, but the picker is where a person browses everything their
+ * machine has and chooses for themselves. English first because the fillers
+ * and personas are English.
+ */
+export function englishVoices(): SpeechSynthesisVoice[] {
+  if (typeof speechSynthesis === 'undefined') return []
+  return speechSynthesis
+    .getVoices()
+    .filter((v) => /^en/i.test(v.lang))
+    .sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name))
+}
+
+/**
+ * Set the voice by exact name — the settings picker's write path.
+ *
+ * Returns false when the name matches nothing installed (the list can change
+ * under the panel's feet as the browser loads remote voices), so the caller
+ * can say so rather than silently keeping the old voice.
+ */
+export function setVoiceByName(name: string): boolean {
+  if (typeof speechSynthesis === 'undefined') return false
+  const hit = speechSynthesis.getVoices().find((v) => v.name === name)
+  if (!hit) return false
+  localStorage.setItem(VOICE_PREF_KEY, name)
+  cachedVoice = hit
+  return true
 }
 
 // Voices load asynchronously in Chrome; the first call usually returns nothing.
@@ -373,18 +470,19 @@ export function createSpeaker(): Speaker {
 
   /** null means "no audio pipeline, use the system voice directly". */
   function synthesise(text: string): Promise<string | null> | null {
-    // Prefer the ElevenLabs voice whenever the bridge reports it is available —
-    // for a demo the timbre is worth the round trip, and this is what makes the
-    // premium path automatic with no flag to set. It falls back to the browser
-    // voice on any failure, so a student without a key still hears him speak.
-    // `nativeBroken` latches on once the system voice has proved unusable.
+    // Prefer the neural/ElevenLabs voice whenever the bridge reports it is
+    // available — for a demo the timbre is worth the round trip, and this is
+    // what makes the premium path automatic with no flag to set. It falls back
+    // to the browser voice on any failure, so a student without a key still
+    // hears him speak. `nativeBroken` latches on once the system voice has
+    // proved unusable.
     if (USE_ELEVENLABS || caps().tts || nativeBroken) {
       // Recorded at the moment the tier is chosen rather than only when the
       // native voice latches over. Without this the panel reported 'system'
       // for a session that had spoken every one of its sentences through
       // ElevenLabs, which makes the one field naming the engine useless
       // exactly when you are trying to work out which engine is at fault.
-      diag.engine = 'elevenlabs'
+      diag.engine = caps().engine === 'elevenlabs' ? 'elevenlabs' : 'neural'
       return fetchCloudAudio(text).catch(() => null)
     }
     if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
@@ -446,7 +544,7 @@ export function createSpeaker(): Speaker {
       if (!nativeBroken) {
         nativeBroken = true
         diag.nativeBroken = true
-        diag.engine = 'elevenlabs'
+        diag.engine = caps().engine === 'elevenlabs' ? 'elevenlabs' : 'neural'
         console.warn('[jarvis] system voice is not producing sound — using the bridge speech proxy from here on')
       }
       const rescue = await fetchCloudAudio(item.text).catch(() => null)
@@ -591,7 +689,12 @@ export function createSpeaker(): Speaker {
       // see the onplaying handler below.
       diag.spoken++
       diag.lastText = text.slice(0, 60)
-      diag.voice = diag.engine === 'kokoro' ? KOKORO_VOICE : 'ElevenLabs'
+      diag.voice =
+        diag.engine === 'kokoro'
+          ? KOKORO_VOICE
+          : diag.engine === 'neural'
+            ? cloudVoiceId()
+            : 'ElevenLabs'
 
       let read: (() => number) | null = null
       const ctx = outputContext()
@@ -736,15 +839,18 @@ export function createSpeaker(): Speaker {
   }
 }
 
-/** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
- *  the key), then a direct key, then null to fall back to the native voice. */
+/** The cloud-quality path: the bridge first (it holds the neural engine and
+ *  any ElevenLabs key), then a direct ElevenLabs key, then null to fall back
+ *  to the native voice. */
 async function fetchCloudAudio(text: string): Promise<string | null> {
   if (BACKEND === 'bridge') {
     try {
       const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
+        // The chosen neural voice rides along; the bridge ignores it when an
+        // ElevenLabs key is configured, so the two engines share one request.
+        body: JSON.stringify({ text, voice: cloudVoiceId() }),
       })
       if (res.ok) return URL.createObjectURL(await res.blob())
     } catch {

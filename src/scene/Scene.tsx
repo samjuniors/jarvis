@@ -5,12 +5,10 @@ import {
   Bloom,
   ChromaticAberration,
   Vignette,
-  Noise,
 } from '@react-three/postprocessing'
-import { BlendFunction } from 'postprocessing'
 import * as THREE from 'three'
 import { Core } from './Core'
-import { Particles } from './Particles'
+import { SofiaOrb } from './SofiaOrb'
 import { Orbits } from './Orbits'
 import { useStore, phaseColor, accentFor, type Phase } from '../store'
 
@@ -27,22 +25,7 @@ const spinFor: Record<Phase, number> = {
 }
 
 /**
- * Surface displacement amplitude. Both states where nothing is happening get
- * the calm figure: 'offline' is the quietest moment in the whole piece — the
- * reactor hasn't been powered on yet — so it must not be the most agitated
- * thing on screen.
- */
-/*
- * Much lower than they were. At 0.13/0.26 on a unit sphere the displacement is
- * a quarter of the radius, which is not a reactor breathing — it is a potato.
- * The reference core is a clean circle whose surface only shimmers; the drama
- * belongs to the instrument rings around it, not to the silhouette.
- */
-const AMP_CALM = 0.035
-const AMP_LIVE = 0.085
-
-/**
- * Everything the three children animate from, in one mutable object.
+ * Everything the children animate from, in one mutable object.
  *
  * These used to be render-time props, which had two consequences. The scene
  * subscribed to mic level, so the entire r3f tree reconciled sixty times a
@@ -61,11 +44,9 @@ export type Drive = {
   color: THREE.Color
   /** 0..1 smoothed loudness, with an idle breath under it. */
   level: number
-  /** Rotation multiplier for the drifting dust. */
+  /** Rotation energy for the dial's drifting layers — the spinFor table. */
   spin: number
-  /** Target displacement amplitude for the core surface. */
-  amp: number
-  /** 0..1 power-up reveal — the ring assembles outwards from the centre. */
+  /** 0..1 power-up reveal — the dial assembles outwards from the centre. */
   open: number
   /**
    * The reactor slice of the ui state, already resolved and smoothed.
@@ -107,12 +88,16 @@ function aim(tint: Tint, css: string): THREE.Color {
 const STYLE_INDEX = { ring: 0, sphere: 1, wire: 2 } as const
 
 function Rig() {
+  // The one store subscription in the scene, and the only re-render it ever
+  // causes: picking a different core swaps the component under the same Drive,
+  // so the new shape mounts, plays its own power-up reveal, and takes over
+  // the same colour and phase signals the old one was reading.
+  const avatar = useStore((s) => s.avatar)
   const drive = useMemo<Drive>(
     () => ({
       color: new THREE.Color(phaseColor.offline),
       level: 0,
       spin: spinFor.offline,
-      amp: AMP_CALM,
       open: 0,
       reactor: {
         color: new THREE.Color(phaseColor.offline),
@@ -157,9 +142,8 @@ function Rig() {
     drive.reactor.visible = r.visible
 
     drive.spin += (spinFor[phase] - drive.spin) * Math.min(1, dt * 2)
-    drive.amp = phase === 'dormant' || phase === 'offline' ? AMP_CALM : AMP_LIVE
-    // Held shut until the reactor is powered on, so the ring builds itself out
-    // of the centre on the ignition click rather than simply appearing.
+    // Held shut until the reactor is powered on, so the dial builds itself
+    // out of the centre on the ignition click rather than simply appearing.
     drive.open = phase === 'offline' ? 0.28 : phase === 'boot' ? 0.7 : 1.6
 
     // Idle breathing so the orb is never completely still.
@@ -185,8 +169,7 @@ function Rig() {
   // subject is one unbroken one.
   return (
     <>
-      <Core drive={drive} />
-      <Particles drive={drive} />
+      {avatar === 'orb' ? <SofiaOrb drive={drive} /> : <Core drive={drive} />}
       <Orbits />
     </>
   )
@@ -232,7 +215,9 @@ export function Scene() {
           radialModulation={false}
           modulationOffset={0}
         />
-        <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
+        {/* No grain: the reference dial floats on a smooth dark void, and
+            speckle there reads as the dust the particles left behind. The
+            vignette carries the depth on its own. */}
         <Vignette eskil={false} offset={0.22} darkness={0.95} />
       </EffectComposer>
     </Canvas>

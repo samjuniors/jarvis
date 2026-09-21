@@ -11,13 +11,14 @@
 // and the page proxy that reads whole documents — and the one thing neither of
 // them may be allowed to reimplement is the gate.
 //
-// Built on the low-level http/https clients rather than fetch() on purpose: it
-// needs a per-connection DNS hook to stop rebinding, manual control of every
-// redirect hop, and a body it can stream and cut off mid-flight.
+// Outbound requests ride curl (see requestOnce) but the gates — vetting every
+// hop, refusing private addresses, pinning DNS — are enforced on this side of
+// the subprocess, so the transport can change again without the policy
+// moving out of this file.
 
-import { request as httpRequest } from 'node:http'
-import { request as httpsRequest } from 'node:https'
-import { lookup as dnsLookup } from 'node:dns'
+import { spawn } from 'node:child_process'
+import { PassThrough } from 'node:stream'
+import { lookup as dnsLookup, promises as dnsPromises } from 'node:dns'
 import { isIP } from 'node:net'
 
 /** A redirect chain longer than this is a loop or a game, not a CDN. */
@@ -169,41 +170,134 @@ export function vetTarget(raw) {
   return url
 }
 
-/** One hop. Resolves with the IncomingMessage once headers are in. */
-export function requestOnce(url, headers, timeoutMs) {
+/**
+ * One hop, carried by curl.
+ *
+ * Node's TLS ClientHello is fingerprinted and refused by a growing slice of
+ * the web — Wikipedia's edge 403s every Node variant while the same request
+ * from curl sails through — and a JARVIS that can show search results but
+ * never open the articles behind them is half an assistant. curl is the
+ * transport; the gates stay ours:
+ *
+ *   - vetTarget ran before this is called, and openRemote re-vets every
+ *     redirect hop, so curl is only ever pointed at a hostname we chose.
+ *   - The hostname is resolved here, checked against blockedAddress, and the
+ *     vetted address pinned with --resolve, so DNS cannot rebind between the
+ *     check and the connection.
+ *
+ * The promise resolves with a stream that looks like the old IncomingMessage
+ * at every point the callers touch: statusCode, headers (lower-cased),
+ * on('data'/'end'/'error'), pause/resume/destroy, and async iteration.
+ */
+export async function requestOnce(url, headers, timeoutMs) {
+  // Resolve once, refuse on any private answer, then pin the address so the
+  // socket dials exactly the IP that was checked.
+  const args = [
+    '-sS',
+    // Headers and body on one stream: the header block is parsed off the front
+    // in onRaw below, and the rest flows to the consumer as it arrives.
+    '-i',
+    '--max-time',
+    String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+  ]
+  if (url.hostname && !isIP(url.hostname)) {
+    let addresses
+    try {
+      addresses = await dnsPromises.lookup(url.hostname, { all: true })
+    } catch {
+      throw proxyError(502, 'upstream unreachable (dns)')
+    }
+    if (!addresses.length) throw proxyError(502, 'upstream unreachable (dns)')
+    for (const entry of addresses) {
+      if (blockedAddress(entry.address)) {
+        throw proxyError(403, 'blocked host')
+      }
+    }
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80')
+    args.push('--resolve', `${url.hostname}:${port}:${addresses[0].address}`)
+  }
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    args.push('-H', `${key}: ${value}`)
+  }
+  args.push(url.href)
+
   return new Promise((resolve, reject) => {
-    const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, {
-      method: 'GET',
-      headers,
-      // The SSRF gate. Everything else here is plumbing.
-      lookup: guardedLookup,
+    let child
+    try {
+      child = spawn('curl', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (err) {
+      return reject(proxyError(502, `transport unavailable: ${err.message}`))
+    }
+
+    const out = new PassThrough()
+    let head = Buffer.alloc(0)
+    let errText = ''
+    let settled = false
+
+    const fail = (status, message) => {
+      if (settled) return
+      settled = true
+      child.kill()
+      reject(proxyError(status, message))
+    }
+
+    const onRaw = (chunk) => {
+      head = head.length ? Buffer.concat([head, chunk]) : chunk
+      const sep = head.indexOf('\r\n\r\n')
+      if (sep === -1) return
+
+      const lines = head.subarray(0, sep).toString('latin1').split('\r\n')
+      const status = /^HTTP\/[\d.]+\s+(\d{3})/i.exec(lines[0] ?? '')
+      if (!status) {
+        return fail(502, 'unparsable upstream response')
+      }
+      const resHeaders = {}
+      for (const line of lines.slice(1)) {
+        const colon = line.indexOf(':')
+        if (colon > 0) {
+          const key = line.slice(0, colon).trim().toLowerCase()
+          const value = line.slice(colon + 1).trim()
+          resHeaders[key] =
+            resHeaders[key] !== undefined
+              ? `${resHeaders[key]}, ${value}`
+              : value
+        }
+      }
+
+      out.statusCode = Number(status[1])
+      out.headers = resHeaders
+      settled = true
+
+      // Stop collecting, then hand the rest of this chunk and everything
+      // after it to the consumer. Both happen in this tick, so nothing can
+      // arrive between them.
+      child.stdout.removeListener('data', onRaw)
+      const rest = head.subarray(sep + 4)
+      child.stdout.pipe(out)
+      if (rest.length) out.write(rest)
+      resolve(out)
+    }
+
+    child.stdout.on('data', onRaw)
+    child.stdout.on('end', () => out.end())
+    child.stdout.on('error', () => out.destroy())
+    child.stderr.on('data', (d) => {
+      errText += d
     })
-    // Two different clocks, deliberately. This one is the deadline for getting
-    // headers back at all — a host that accepts the connection and then says
-    // nothing must not hold a panel open for ever.
-    const deadline = setTimeout(() => {
-      req.destroy(proxyError(504, 'upstream timed out'))
-    }, timeoutMs)
-    // And this one is idle-socket: once the body is flowing, a 200 MB video is
-    // allowed to take longer than 30 seconds as long as bytes keep arriving.
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(proxyError(504, 'upstream stalled'))
+    child.on('error', (err) => fail(502, `transport unavailable: ${err.message}`))
+    child.on('close', (code) => {
+      if (!settled) {
+        // Headers never arrived: DNS, TLS, connection, or the clock.
+        if (code === 28) fail(504, 'upstream timed out')
+        else {
+          const note = errText.trim().split('\n')[0]?.slice(0, 120)
+          fail(502, `upstream unreachable${note ? `: ${note}` : ''}`)
+        }
+      }
     })
-    req.on('response', (res) => {
-      clearTimeout(deadline)
-      resolve(res)
-    })
-    req.on('error', (err) => {
-      clearTimeout(deadline)
-      reject(
-        err.code === 'EBLOCKEDADDRESS'
-          ? proxyError(403, 'blocked host')
-          : err.status
-            ? err
-            : proxyError(502, 'upstream unreachable'),
-      )
-    })
-    req.end()
+    // A consumer that destroys the stream (peek does, the byte caps do) must
+    // not leave curl running behind it.
+    out.on('close', () => child.kill())
   })
 }
 

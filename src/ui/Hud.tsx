@@ -1,21 +1,100 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { useStore, accentFor, type Phase } from '../store'
+import { personaById } from '../lib/personas'
 import { Suggestions } from './Suggestions'
 import { BladeSweep, Blades } from './Blades'
 import { Effects } from './Effects'
 import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
+import { Settings } from './Settings'
 
-const statusText: Record<Phase, string> = {
-  offline: 'OFFLINE',
-  boot: 'INITIALISING',
-  dormant: 'STANDBY — SAY “HEY JARVIS”',
-  waking: 'ONLINE',
-  listening: 'LISTENING',
-  thinking: 'PROCESSING',
-  tooling: 'ACCESSING SYSTEMS',
-  speaking: 'RESPONDING',
+/** The status line, one per phase. The standby hint is persona-driven — it
+ *  names the wake word the recogniser is actually hunting for, and only adds
+ *  the clap alternative when the clap detector is actually armed. */
+function statusText(phase: Phase, wake: string, voiceLive: boolean, clapLive: boolean): string {
+  switch (phase) {
+    case 'offline':
+      return 'OFFLINE'
+    case 'boot':
+      return 'INITIALISING'
+    case 'dormant':
+      // If the microphone never opened, telling someone to say the wake word
+      // is a lie — the honest instruction is the command line.
+      if (!voiceLive) return 'STANDBY — TYPE A COMMAND'
+      return clapLive
+        ? `STANDBY — SAY “${wake.toUpperCase()}” OR CLAP`
+        : `STANDBY — SAY “${wake.toUpperCase()}”`
+    case 'waking':
+      return 'ONLINE'
+    case 'listening':
+      return 'LISTENING'
+    case 'thinking':
+      return 'THINKING'
+    case 'tooling':
+      return 'WORKING'
+    case 'speaking':
+      return 'SPEAKING'
+  }
+}
+
+/**
+ * The status pill's icon, one per state. The state should be legible at a
+ * glance, before the text is read: bars while the machine hears you, an arc
+ * while it works, a slower waveform while it talks.
+ */
+function StateIcon({ phase }: { phase: Phase }) {
+  const cls = 'state-ico'
+  switch (phase) {
+    case 'offline':
+      return (
+        <span className={cls} aria-hidden>
+          <i className="s-dot hollow" />
+        </span>
+      )
+    case 'boot':
+    case 'thinking':
+      return (
+        <span className={cls} aria-hidden>
+          <i className="s-arc" />
+        </span>
+      )
+    case 'tooling':
+      return (
+        <span className={cls} style={{ alignItems: 'center', gap: 2 }} aria-hidden>
+          <i className="s-arc" style={{ width: 8, height: 8 }} />
+          <i className="s-tick" style={{ width: 8, height: 2 }} />
+        </span>
+      )
+    case 'listening':
+      return (
+        <span className={`${cls} hearing`} aria-hidden>
+          <i className="s-bar" />
+          <i className="s-bar" />
+          <i className="s-bar" />
+        </span>
+      )
+    case 'speaking':
+      return (
+        <span className={`${cls} talking`} aria-hidden>
+          <i className="s-bar" />
+          <i className="s-bar" />
+          <i className="s-bar" />
+        </span>
+      )
+    case 'waking':
+      return (
+        <span className={cls} aria-hidden>
+          <i className="s-dot fast" />
+        </span>
+      )
+    default:
+      return (
+        <span className={cls} aria-hidden>
+          <i className="s-dot" />
+        </span>
+      )
+  }
 }
 
 function Corner({ at }: { at: 'tl' | 'tr' | 'bl' | 'br' }) {
@@ -159,6 +238,10 @@ export function Hud() {
   const gestures = useStore((s) => s.gestures)
   const looking = useStore((s) => s.looking)
   const ui = useStore((s) => s.ui)
+  const persona = useStore((s) => s.persona)
+  const voiceLive = useStore((s) => s.voiceLive)
+  const clapLive = useStore((s) => s.clapLive)
+  const p = personaById(persona)
 
   // accentFor folds JARVIS's overrides in over the phase colour, so one
   // variable on the root carries a theme change into every .hud-* rule without
@@ -190,22 +273,28 @@ export function Hud() {
       <header className="hud-top">
         {ui.chrome.brand && (
           <div className="brand">
-            <span className="brand-mark">J.A.R.V.I.S.</span>
-            <span className="brand-sub">Just A Rather Very Intelligent System</span>
+            <span className="brand-mark">{p.mark}</span>
+            <span className="brand-sub">{p.sub}</span>
           </div>
         )}
 
         <div className="status">
-          <span className="dot" />
+          <StateIcon phase={phase} />
           <span className="status-text">
             {/* bootNote is the voice-model download readout. It is only ever
                 the right thing to show during boot — as a general fallback a
                 note that never got cleared (a stuck 'voice 97%') sits over
                 LISTENING and PROCESSING for the rest of the session. */}
-            {phase === 'boot' && bootNote ? bootNote : statusText[phase]}
+            {phase === 'boot' && bootNote
+              ? bootNote
+              : statusText(phase, p.wake, voiceLive, clapLive)}
           </span>
         </div>
       </header>
+
+      {/* The settings corner — persona, voice. Kept out of the header flex
+          so it keeps its own anchor when the brand is hidden by ui_chrome. */}
+      <Settings />
 
       {/* Left rail: which integrations are live */}
       {ui.chrome.systems && (
@@ -273,7 +362,7 @@ export function Hud() {
                 exit={{ opacity: 0 }}
                 transition={{ type: 'spring', stiffness: 320, damping: 32 }}
               >
-                <span className="log-who">{t.role === 'user' ? 'YOU' : 'JARVIS'}</span>
+                <span className="log-who">{t.role === 'user' ? 'YOU' : p.short}</span>
                 {/* Only his half decodes. What the user said was never
                     transmitted from anywhere — dressing it up as machine
                     output would be a lie about where the words came from. */}
@@ -312,7 +401,16 @@ export function Hud() {
 
       <footer className="hud-bottom">
         <span className="hint">
-          say <b>“hey jarvis”</b> · <kbd>Space</kbd> to talk · <kbd>G</kbd> hands
+          {voiceLive ? (
+            <>
+              say <b>“{p.wake}”</b> · <kbd>Space</kbd> to talk
+            </>
+          ) : (
+            <>
+              voice off in this pane — open in a new tab · type below
+            </>
+          )}{' '}
+          · <kbd>G</kbd> hands
           {voice && (
             <>
               {' · '}

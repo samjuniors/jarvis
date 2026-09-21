@@ -1,12 +1,15 @@
 import { useStore } from '../store'
+import { personaById } from '../lib/personas'
 
 /**
  * The start gate.
  *
  * Browsers refuse to play audio or start speech synthesis until the user has
- * interacted with the page, so something has to be clicked before JARVIS can
- * make a sound. Rather than hide that behind a permissions banner, it's the
- * cold open: a dead interface waiting to be switched on.
+ * interacted with the page, so something has to be clicked before the
+ * assistant can make a sound. Rather than hide that behind a permissions
+ * banner, the cold open is a quiet loading screen — the name, a progress
+ * sweep, and the one instruction that matters: click anywhere, or clap, to
+ * bring it up.
  *
  * Deliberately NOT wrapped in AnimatePresence, and the reason is worth keeping.
  *
@@ -29,26 +32,35 @@ import { useStore } from '../store'
  * that copy the phase is forever 'offline', so a guard written in terms of it
  * can never fire.
  *
- * A plain conditional cannot strand anything. The fade-in survives because
- * mounting is not the dangerous direction; the fade-out is gone, and the boot
- * sequence takes the screen immediately anyway, so there is nothing to see.
+ * A plain conditional cannot strand anything. The boot sequence takes the
+ * screen immediately anyway, so there is nothing to see fading.
  */
 export function Ignition({ onStart }: { onStart: () => void }) {
   const phase = useStore((s) => s.phase)
+  const persona = useStore((s) => s.persona)
+  const clapLive = useStore((s) => s.clapLive)
   if (phase !== 'offline') return null
+
+  const p = personaById(persona)
 
   return (
     <button className="ignition" onClick={onStart}>
-      {/*
-        Spun by CSS rather than framer. As a motion element with
-        `repeat: Infinity` it was one of the things keeping the exit from ever
-        finishing — AnimatePresence waits for a leaving subtree's animations,
-        and an infinite one never ends.
-      */}
-      <span className="ignition-ring" />
+      {/* Spun by CSS rather than framer. As a motion element with
+          `repeat: Infinity` it was one of the things keeping the exit from ever
+          finishing — AnimatePresence waits for a leaving subtree's animations,
+          and an infinite one never ends. */}
       <span className="ignition-label">
-        <span className="ignition-word">INITIALISE</span>
-        <span className="ignition-sub">click, or clap, to power up</span>
+        <span className="ignition-name">{p.mark}</span>
+        <span className="ignition-bar">
+          <span className="ignition-bar-fill" />
+        </span>
+        <span className="ignition-word">AI IS INITIALIZING</span>
+        {/* The clap offer only appears when the microphone actually opened —
+            a pane that blocks getUserMedia would otherwise promise a clap it
+            can never hear, which is exactly the bug “clap not working” was. */}
+        <span className="ignition-sub">
+          {clapLive ? 'click anywhere — or clap — to power up' : 'click anywhere to power up'}
+        </span>
       </span>
     </button>
   )

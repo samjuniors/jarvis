@@ -1,11 +1,11 @@
 import { useEffect, useRef } from 'react'
 import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
-import { Boot } from './ui/Boot'
 import { Ignition } from './ui/Ignition'
 import { Diagnostics } from './ui/Diagnostics'
+import { CommandLine } from './ui/CommandLine'
 import { useStore } from './store'
-import { startVoice, type Voice, type VoiceMode } from './lib/voice'
+import { startVoice, setWakePersona, type Voice, type VoiceMode } from './lib/voice'
 import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
@@ -14,7 +14,8 @@ import { listenForClap } from './lib/clap'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { TTS_ENGINE } from './config'
-import { forTool, attention } from './lib/fillers'
+import { forTool, attention, setFillerPersona } from './lib/fillers'
+import { personaById } from './lib/personas'
 import {
   ask,
   warm,
@@ -62,19 +63,39 @@ const newId = () =>
   `id${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
 
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
- *  that woke him as "travis" gets that word sent on to the model as a question. */
-const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
-/** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
-/** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
+ *  that woke the machine as “travis” gets that word sent on to the model as a
+ *  question. Read fresh from the persona each time: the character can change
+ *  under a long-lived page, and a stale name would strip the wrong word. */
+const namePattern = () => personaById(useStore.getState().persona).heardAs
+/** A bare vocative — “Sofia”, “hey sofia” — with nothing asked. */
+const bareName = () =>
+  new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*(?:${namePattern()})[\\s,.!?]*$`, 'i')
+/** A leading vocative on a real command: “Sofia, what's the weather”. */
+const leadingName = () =>
+  new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*(?:${namePattern()})\\b[\\s,.:!?-]*`, 'i')
 
 export default function App() {
   const store = useStore
   const phase = useStore((s) => s.phase)
+  const persona = useStore((s) => s.persona)
   const history = useRef<Msg[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<Voice | null>(null)
+
+  // -- persona ------------------------------------------------------------
+
+  /**
+   * Everything that has to follow the character, gathered in one place so a
+   * switch is atomic: the wake word the recogniser hunts for, the filler
+   * lines it speaks, and the document title. The HUD, the dial and the boot
+   * screen subscribe to the store themselves.
+   */
+  useEffect(() => {
+    const p = personaById(persona)
+    setWakePersona(persona)
+    setFillerPersona(persona)
+    document.title = p.mark
+  }, [persona])
 
   /**
    * Monotonic turn counter. Every await in a turn checks it on the way out:
@@ -85,6 +106,9 @@ export default function App() {
   const booting = useRef(false)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  /** Set by the voice loop's mic failure — the one error that means voice is
+   *  off for good, and so the one that must outlive startVoice returning. */
+  const micDead = useRef(false)
 
   // -- helpers --------------------------------------------------------------
 
@@ -180,7 +204,9 @@ export default function App() {
             spk.say(forTool(name))
           }
         },
-      })
+        // The character the brain should answer as — re-read per turn so a
+        // mid-session persona switch takes effect on the very next question.
+      }, store.getState().persona)
 
       if (stale()) return
 
@@ -293,18 +319,46 @@ export default function App() {
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant') return
 
-    // People keep using his name as a vocative once they're already talking to
-    // him. Strip it rather than sending "jarvis" to the model as a question.
-    if (BARE_NAME.test(text)) {
+    // People keep using the name as a vocative once they're already talking to
+    // the machine. Strip it rather than sending "sofia" to the model as a
+    // question.
+    if (bareName().test(text)) {
       listen(AWAIT_SPEECH_MS)
       return
     }
-    const said = text.replace(LEADING_NAME, '').trim()
+    const said = text.replace(leadingName(), '').trim()
     if (!said) {
       listen(AWAIT_SPEECH_MS)
       return
     }
 
+    void respond(said)
+  }
+
+  /**
+   * The typed command line. A `jarvis:say` event is the keyboard's version of
+   * a recognised utterance: same road, same rules. Idle, it starts a turn;
+   * busy, it barge-ins exactly like speaking over him does — the in-flight
+   * answer is interrupted, its turn goes stale, and this one replaces it.
+   */
+  const onSay = (e: Event) => {
+    const said = String((e as CustomEvent<string>).detail ?? '').trim()
+    if (!said) return
+
+    const phase = store.getState().phase
+    if (phase === 'boot') return
+
+    if (phase === 'offline') {
+      // The ignition screen is still up; boot first, then ask the moment the
+      // interface lands.
+      void powerOn().then(() => respond(said))
+      return
+    }
+
+    if (phase === 'thinking' || phase === 'tooling' || phase === 'speaking') {
+      silence()
+      interrupt()
+    }
     void respond(said)
   }
 
@@ -314,6 +368,15 @@ export default function App() {
 
   const onVoiceError = (message: string) => {
     store.getState().setError(message)
+    // The two mic failures are the only ones that mean voice is off for good
+    // — transient recogniser hiccups fire this too, and must not flip the
+    // standby hint to “type a command”. The ref survives startVoice returning
+    // its dead object, so the optimistic setVoiceLive(true) after it cannot
+    // overwrite what happened here.
+    if (/microphone/i.test(message)) {
+      micDead.current = true
+      store.getState().setVoiceLive(false)
+    }
   }
 
   // -- power on -------------------------------------------------------------
@@ -487,14 +550,13 @@ export default function App() {
       }, 200)
     }
 
-    // Long enough for the four-beat start-up sequence in Boot.tsx to play —
-    // status bar, rings, suit schematic, reactor power-up — before the live
-    // interface takes over. Kept a touch under the boot cue so the music is
-    // still rising as the reactor lands.
-    await new Promise((r) => setTimeout(r, 9200)) // boot sequence
+    // No boot screen any more — the initializing screen was the last gate, and
+    // the interface lands the moment the click lands. Everything below is the
+    // live machine coming up: the warm-up, the mic analyser, the speech probe
+    // and the voice loop, in that order because each is cheap enough not to be
+    // worth a screen of its own.
     await warming
     store.getState().setConnected(connectedLabels())
-    store.getState().setVoice(currentVoiceName())
 
     // The analyser is what makes the reactor pulse with your voice. It needs a
     // getUserMedia stream; speech recognition does not, and gets its own. So a
@@ -514,6 +576,11 @@ export default function App() {
     // fallback when it is not — no flag, no reload.
     await probeCapabilities()
 
+    // Only now can the HUD name the voice honestly: the label depends on the
+    // probe (neural catalogue vs system inventory). Reading it before the
+    // probe landed showed "default" for the whole session.
+    store.getState().setVoice(currentVoiceName())
+
     // One voice loop, started once, running until the page closes.
     voice.current = await startVoice({
       mode,
@@ -524,36 +591,56 @@ export default function App() {
       onError: onVoiceError,
     })
 
+    // The loop is live unless the mic failed on the way up — a denied mic
+    // reports itself through onError before this line runs, and that verdict
+    // is the one that must stick.
+    if (!micDead.current) store.getState().setVoiceLive(true)
+
     store.getState().setPhase('dormant')
   }
 
-  // -- clap to start --------------------------------------------------------
+  // -- clap to wake ------------------------------------------------------------
 
   /**
-   * A clap brings him up, as an alternative to the button.
+   * A clap brings her up — from the ignition screen, and from standby.
    *
-   * Only while the ignition screen is showing, and torn down the moment he
-   * boots — the microphone is about to belong to the voice loop, and two
-   * analysers arguing over the same stream is how you get an assistant that
-   * hears half of what you say.
+   * Two places it can land, and both are "the machine is idle and dark": while
+   * the initializing screen is showing (the click alternative), and once the
+   * HUD is standing by (the "hey sofia" alternative). Any busier than that —
+   * waking, listening, thinking, speaking — and a clap is either redundant or
+   * a stray interruption, so the listener is stood down instead.
    *
-   * Deliberately silent about failure. If the microphone is refused, or has not
-   * been granted yet, the button is still right there; announcing an error
-   * about a feature nobody asked for would be worse than quietly doing without.
+   * The microphone stream is shared with the voice loop, so arming here can
+   * never steal the assistant's hearing; it is torn down on every phase change
+   * and re-armed when the machine goes idle again.
+   *
+   * clapLive tracks whether the detector actually exists — a pane that blocks
+   * getUserMedia gets an honest hint instead of a promise a clap can't keep.
    */
   useEffect(() => {
-    if (phase !== 'offline') return
+    if (phase !== 'offline' && phase !== 'dormant') return
     let live: { stop: () => void } | null = null
     let gone = false
     void listenForClap(() => {
-      if (!gone) void powerOn()
+      if (gone) return
+      const now = store.getState().phase
+      if (now === 'offline') {
+        void powerOn()
+      } else if (now === 'dormant') {
+        onWake('')
+      }
     }).then((l) => {
-      if (gone) l.stop()
-      else live = l
+      if (gone) {
+        l?.stop()
+      } else {
+        live = l
+        if (l) store.getState().setClapLive(true)
+      }
     })
     return () => {
       gone = true
       live?.stop()
+      store.getState().setClapLive(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase])
@@ -596,7 +683,7 @@ export default function App() {
         silence()
         const demo = createSpeaker()
         speaker.current = demo
-        demo.say(`Voice set to ${name.replace(/\(.*?\)/g, '').trim()}. At your service, sir.`)
+        demo.say(personaById(store.getState().persona).fillers.voiceSet)
         void demo.end()
         return
       }
@@ -681,10 +768,12 @@ export default function App() {
       }
     }
     window.addEventListener('keydown', onKey)
+    window.addEventListener('jarvis:say', onSay as EventListener)
 
     return () => {
       cancelAnimationFrame(raf)
       window.removeEventListener('keydown', onKey)
+      window.removeEventListener('jarvis:say', onSay as EventListener)
       clearIdle()
       if (voicePoll.current) clearInterval(voicePoll.current)
       voice.current?.stop()
@@ -699,8 +788,8 @@ export default function App() {
     <>
       <Scene />
       <Hud />
-      <Boot />
       <Diagnostics />
+      <CommandLine />
       <Ignition onStart={() => void powerOn()} />
     </>
   )
